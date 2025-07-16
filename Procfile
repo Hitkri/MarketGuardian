@@ -1,0 +1,1 @@
+worker: python Final_Updated_MarketGuardian.py
