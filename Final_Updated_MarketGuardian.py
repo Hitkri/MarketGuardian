@@ -15,7 +15,7 @@ from telegram.ext import (
 )
 
 # === НАСТРОЙКИ ===
-TELEGRAM_BOT_TOKEN = "ТВОЙ_ТГ_БОТ_ТОКЕН"
+TELEGRAM_BOT_TOKEN = "7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0"
 OPENAI_API_KEY = "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"
 openai.api_key = OPENAI_API_KEY
 
