@@ -109,7 +109,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     elif data == "futures_manual":
         await choose_futures_pair(user_id, query)
     elif data == "futures_auto":
-        # запускать автопоиск через JobQueue, не через вечный цикл!
         context.job_queue.run_repeating(
             auto_futures_signals, interval=3600, first=1, data=user_id, name=f"auto_{user_id}"
         )
@@ -131,13 +130,10 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]])
         )
 
+# --- ВОТ ТУТ ФИКС ДЛЯ КНОПОК ---
 async def choose_futures_pair(user_id, query):
-    keyboard = [
-        [InlineKeyboardButton(pair, callback_data=f"futures_pair_{pair}")]
-        for pair in FUTURES_PAIRS
-    ]
-    # по 2 кнопки в ряд
-    buttons = [keyboard[i:i+2] for i in range(0, len(keyboard), 2)]
+    flat_buttons = [InlineKeyboardButton(pair, callback_data=f"futures_pair_{pair}") for pair in FUTURES_PAIRS]
+    buttons = [flat_buttons[i:i+2] for i in range(0, len(flat_buttons), 2)]
     buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")])
     markup = InlineKeyboardMarkup(buttons)
     await query.edit_message_text("Выбери пару для сигнала:", reply_markup=markup)
