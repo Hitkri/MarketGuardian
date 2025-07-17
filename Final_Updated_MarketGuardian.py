@@ -3,38 +3,45 @@ import logging
 import time
 import uuid
 import sqlite3
-from datetime import datetime
 import ccxt
+import requests
+import openai
+import random
+from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
-    ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, JobQueue
+    ApplicationBuilder, CommandHandler, CallbackQueryHandler,
+    ContextTypes, JobQueue
 )
 
-# ==== Настройки ====
-TELEGRAM_BOT_TOKEN = "7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0"
-ADMIN_ID = 1407143951
+# === НАСТРОЙКИ ===
+TELEGRAM_BOT_TOKEN = "ТВОЙ_ТГ_БОТ_ТОКЕН"
+OPENAI_API_KEY = "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"
+openai.api_key = OPENAI_API_KEY
 
-api_keys = {
-    "Binance": {
-        "api_key": "7Jr5VPDXj22dQak9tUlJYFyM4v58hP7VarHBQoJPgfLn7qV4rJgzuyNCP8cBHqZx",
-        "api_secret": "mc4htJRKnEJPAKMXERsv9l0S1w4MbLAuO8UjVUzMv3DPYY8nz5LAJ4K98CkGhuvu",
-    }
-}
+BUDGET_FUTURES = 500  # для фьючерсов
+BUDGET_SPOT = 3000    # для спота
 
 FUTURES_PAIRS = [
-    "BTC/USDT", "ETH/USDT", "BNB/USDT", "SOL/USDT", "XRP/USDT", "ADA/USDT", "DOGE/USDT",
-    "LTC/USDT", "AVAX/USDT", "LINK/USDT", "MATIC/USDT", "DOT/USDT", "BCH/USDT", "OP/USDT",
-    "FIL/USDT", "TON/USDT", "WIF/USDT", "PEPE/USDT", "1000SATS/USDT", "SEI/USDT"
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    "ADA/USDT", "DOGE/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT",
+    "SHIB/USDT", "DOT/USDT", "OP/USDT", "TON/USDT", "ARBUSDT",
+    "SEI/USDT", "SUI/USDT", "LTC/USDT", "BCH/USDT", "INJ/USDT"
+]
+SPOT_PAIRS = [
+    "BTC/USDT", "ETH/USDT", "SOL/USDT", "BNB/USDT", "XRP/USDT",
+    "ADA/USDT", "DOGE/USDT", "LINK/USDT", "AVAX/USDT", "MATIC/USDT",
+    "SHIB/USDT", "DOT/USDT", "OP/USDT", "TON/USDT", "ARBUSDT",
+    "SEI/USDT", "SUI/USDT", "LTC/USDT", "BCH/USDT", "INJ/USDT"
 ]
 
-FUTURES_LEVERAGE = 10
-SPOT_AMOUNT = 3000
-FUTURES_BUDGET = 500
+ADMIN_ID = 1407143951
 
-# ==== База данных ====
+# === ЛОГИ ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# === БД ДЛЯ ТОКЕНОВ ===
 conn = sqlite3.connect("access_tokens.db", check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute("""
@@ -45,117 +52,22 @@ CREATE TABLE IF NOT EXISTS tokens (
     activation_time TIMESTAMP
 )
 """)
-cursor.execute("""
-CREATE TABLE IF NOT EXISTS signals_log (
-    user_id INTEGER,
-    ts TIMESTAMP,
-    type TEXT,
-    pair TEXT,
-    direction TEXT,
-    entry REAL,
-    take REAL,
-    stop REAL,
-    result REAL,
-    comment TEXT
-)
-""")
 conn.commit()
 
-# ==== Binance ====
-exchanges = {
-    "Binance": ccxt.binance({
-        "apiKey": api_keys["Binance"]["api_key"],
-        "secret": api_keys["Binance"]["api_secret"],
-        "enableRateLimit": True,
-        "options": {"defaultType": "future"}
-    }),
-}
-spot_exchange = ccxt.binance({
-    "apiKey": api_keys["Binance"]["api_key"],
-    "secret": api_keys["Binance"]["api_secret"],
+# === EXCHANGE INIT ===
+binance = ccxt.binance({
     "enableRateLimit": True,
+    "options": {"defaultType": "future"}
 })
 
-# ==== Access ====
+# === ACCESS ===
 def user_has_access(user_id):
     cursor.execute("SELECT user_id FROM tokens WHERE user_id = ?", (user_id,))
     return cursor.fetchone() is not None
 
-# ==== Вспомогательные функции ====
-def get_volatility(ticker):
-    try:
-        high = ticker['high']
-        low = ticker['low']
-        open_ = ticker['open']
-        if open_ == 0: return 0
-        return (high - low) / open_
-    except: return 0
-
-def now_time_str():
-    return datetime.now().strftime('%H:%M')
-
-def is_time_allowed():
-    now = datetime.now().time()
-    start = datetime.strptime("08:00", "%H:%M").time()
-    end = datetime.strptime("00:00", "%H:%M").time()
-    if start <= now or now <= end:  # 00:00 — это полночь
-        return True
-    return False
-
-def explain_signal(pair, direction, change, vol, volume):
-    # Индивидуальный комментарий под каждую пару
-    base = f"{pair}: "
-    trend = "сильное движение" if abs(change) > 1 else "умеренное движение"
-    volatility = "высокая волатильность" if vol > 0.02 else "низкая волатильность"
-    liquidity = "высокий объём" if volume > 1_000_000 else "обычный объём"
-    if "BTC" in pair:
-        comment = f"{base}Основание: {trend}, {volatility}, {liquidity}. На BTC часто формируются большие движения."
-    elif "ETH" in pair:
-        comment = f"{base}ETH реагирует на общерыночные тренды. {trend}, {liquidity} — хорошая точка входа."
-    elif "SOL" in pair:
-        comment = f"{base}SOL даёт быстрые импульсы — {trend}, {volatility}."
-    elif "XRP" in pair:
-        comment = f"{base}XRP часто идёт против рынка. Сейчас {trend}, {volatility}."
-    else:
-        comment = f"{base}{trend}, {volatility}, {liquidity}."
-    if direction == "LONG":
-        comment += " Возможен рост при продолжении импульса."
-    else:
-        comment += " Возможен откат при смене тренда."
-    return comment
-
-# ==== Главное меню ====
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.message.chat_id
-    if user_has_access(user_id):
-        await send_main_menu(update, context)
-    else:
-        await update.message.reply_text("❌ У вас нет доступа. Пожалуйста, активируйте токен для использования бота.")
-
-async def send_main_menu(update, context):
-    keyboard = [
-        [InlineKeyboardButton("📊 Спот сигналы", callback_data="menu:spot")],
-        [InlineKeyboardButton("⚡️ Фьючерсы (ручной выбор)", callback_data="menu:manual_futures")],
-        [InlineKeyboardButton("🤖 Автопоиск (фьючерсы)", callback_data="menu:auto_futures")],
-        [InlineKeyboardButton("🗂 Отчёт", callback_data="menu:portfolio")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    text = (
-        "<b>MarketGuardian PRO</b>\n\n"
-        "Выберите режим:\n"
-        "📊 Спот сигналы\n"
-        "⚡️ Фьючерсы (ручной)\n"
-        "🤖 Автопоиск (фьючерсы)\n"
-        "🗂 Отчёт/Журнал\n"
-    )
-    if update.message:
-        await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="HTML")
-    elif update.callback_query:
-        await update.callback_query.edit_message_text(text, reply_markup=reply_markup, parse_mode="HTML")
-
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message.chat_id != ADMIN_ID:
-        await update.message.reply_text("❌ Нет прав для генерации токенов.")
+        await update.message.reply_text("❌ Нет доступа.")
         return
     token = str(uuid.uuid4())
     cursor.execute("INSERT INTO tokens (token) VALUES (?)", (token,))
@@ -166,284 +78,181 @@ async def activate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.message.chat_id
     username = update.message.chat.username
     if len(context.args) != 1:
-        await update.message.reply_text("❌ Используйте: /activate <токен>")
+        await update.message.reply_text("❌ Используй: /activate <токен>")
         return
     token = context.args[0]
     cursor.execute("SELECT token FROM tokens WHERE token = ? AND user_id IS NULL", (token,))
     if cursor.fetchone():
         activation_time = time.time()
-        cursor.execute(
-            "UPDATE tokens SET user_id = ?, username = ?, activation_time = ? WHERE token = ?",
-            (user_id, username, activation_time, token)
-        )
+        cursor.execute("UPDATE tokens SET user_id = ?, username = ?, activation_time = ? WHERE token = ?", (user_id, username, activation_time, token))
         conn.commit()
-        await update.message.reply_text("✅ Токен активирован! Теперь у вас есть доступ к боту.")
-        await send_main_menu(update, context)
+        await update.message.reply_text("✅ Токен активирован!")
+        await main_menu(update, context)
     else:
         await update.message.reply_text("❌ Неверный или уже использованный токен.")
 
+# === МЕНЮ ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.message.chat_id
+    if user_has_access(user_id):
+        await main_menu(update, context)
+    else:
+        await update.message.reply_text("❌ Нет доступа. Активируйте токен командой /activate <токен>.")
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🟢 Рекомендации для СПОТ", callback_data="spot_recommend")],
+        [InlineKeyboardButton("💎 20 пар на ФЬЮЧЕРСАХ", callback_data="futures_manual")],
+        [InlineKeyboardButton("⚡ Автопоиск (фьючерсы)", callback_data="futures_auto")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text("<b>Выбери режим:</b>", reply_markup=reply_markup, parse_mode="HTML")
+    elif update.callback_query:
+        await update.callback_query.edit_message_text("<b>Выбери режим:</b>", reply_markup=reply_markup, parse_mode="HTML")
+
+# === CALLBACK ===
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    data = query.data.split(":")
-    logger.info(f"Button: {data}")
-    if data[0] == "menu":
-        if data[1] == "spot":
-            await spot_signal_handler(update, context)
-        elif data[1] == "manual_futures":
-            await manual_futures_menu(update, context)
-        elif data[1] == "auto_futures":
-            await auto_futures_handler(update, context)
-        elif data[1] == "portfolio":
-            await portfolio_handler(update, context)
-    elif data[0] == "select_futures":
-        await send_manual_futures_signal(update, context, data[1])
-    elif data[0] == "back":
-        await send_main_menu(update, context)
+    data = query.data
+    user_id = query.message.chat.id
 
-# ==== СПОТ СИГНАЛЫ ====
-async def spot_signal_handler(update, context):
-    await update.callback_query.edit_message_text("⏳ Ищем лучшие сигналы на споте (Binance)...")
-    pairs = spot_exchange.load_markets()
-    spot_pairs = [s for s in pairs if "/USDT" in s and not pairs[s]['future'] and pairs[s]['active'] and pairs[s]['quote'] == "USDT"]
-    spot_pairs = sorted(spot_pairs, key=lambda x: -pairs[x]['info'].get('quoteVolume', 0))[:20]
-    signals = []
-    for pair in spot_pairs:
-        try:
-            ticker = spot_exchange.fetch_ticker(pair)
-            price = ticker['last']
-            vol = get_volatility(ticker)
-            change = ticker.get('percentage', 0)
-            volume = ticker['quoteVolume']
-            target_profit = 50  # $50
-            stop_loss_pct = 0.03  # 3% от позиции
-            direction = "LONG" if change > 0 else "SHORT"
-            budget = SPOT_AMOUNT
-            stop = round(price * (1 - stop_loss_pct if direction == "LONG" else 1 + stop_loss_pct), 4)
-            take = price + target_profit if direction == "LONG" else price - target_profit
-            # Фильтр: вход, если за день движение и объём выше среднего
-            if abs(change) > 1 and volume > 1_000_000 and budget/price >= 10:
-                comment = explain_signal(pair, direction, change, vol, volume)
-                signals.append({
-                    "pair": pair, "price": price, "direction": direction,
-                    "take": take, "stop": stop, "comment": comment
-                })
-        except Exception as e:
-            continue
+    if data == "spot_recommend":
+        await send_spot_signal(user_id, context)
+    elif data == "futures_manual":
+        await choose_futures_pair(user_id, query)
+    elif data == "futures_auto":
+        await start_auto_futures(user_id, context)
+    elif data.startswith("futures_pair_"):
+        pair = data.split("futures_pair_")[1]
+        await send_futures_signal(user_id, pair, context)
+    elif data == "main_menu":
+        await main_menu(update, context)
+    elif data == "stop_auto":
+        context.user_data['auto'] = False
+        await query.edit_message_text("Автопоиск остановлен.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]]))
 
-    if signals:
-        text = "<b>Лучшие спот-сигналы (Binance):</b>\n\n"
-        for s in signals:
-            text += (
-                f"{s['pair']} | {s['direction']}\n"
-                f"Вход: {s['price']}\n"
-                f"Тейк: {round(s['take'],2)} | Стоп: {round(s['stop'],2)}\n"
-                f"{s['comment']}\n\n"
-            )
-        keyboard = [[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]]
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-    else:
-        await update.callback_query.edit_message_text(
-            "Нет хороших входов на споте сейчас. Попробуй чуть позже.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]])
-        )
+async def choose_futures_pair(user_id, query):
+    keyboard = [
+        [InlineKeyboardButton(pair, callback_data=f"futures_pair_{pair}")]
+        for pair in FUTURES_PAIRS
+    ]
+    # По 2 кнопки в ряд
+    buttons = [keyboard[i:i+2] for i in range(0, len(keyboard), 2)]
+    buttons.append([InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")])
+    markup = InlineKeyboardMarkup(buttons)
+    await query.edit_message_text("Выбери пару для сигнала:", reply_markup=markup)
 
-# ==== ФЬЮЧЕРСЫ РУЧНО ====
-async def manual_futures_menu(update, context):
-    keyboard = []
-    for pair in FUTURES_PAIRS:
-        keyboard.append([InlineKeyboardButton(pair, callback_data=f"select_futures:{pair}")])
-    keyboard.append([InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")])
-    await update.callback_query.edit_message_text(
-        "<b>Выберите фьючерсную пару:</b>", reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML"
-    )
+# === SPOT SIGNAL ===
+async def send_spot_signal(user_id, context):
+    pair = random.choice(SPOT_PAIRS)
+    signal = analyze_pair(pair, budget=BUDGET_SPOT, mode="spot")
+    comment = get_ai_comment(pair, signal)
+    msg = make_signal_message(signal, pair, "СПОТ", comment)
+    await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]]))
 
-async def send_manual_futures_signal(update, context, pair):
-    await update.callback_query.edit_message_text(f"⏳ Анализ {pair}...")
+# === FUTURES SIGNAL ===
+async def send_futures_signal(user_id, pair, context):
+    signal = analyze_pair(pair, budget=BUDGET_FUTURES, mode="futures")
+    comment = get_ai_comment(pair, signal)
+    msg = make_signal_message(signal, pair, "ФЬЮЧЕРСЫ", comment)
+    await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]]))
+
+# === AUTO FUTURES ===
+async def start_auto_futures(user_id, context):
+    context.user_data['auto'] = True
+    await context.bot.send_message(chat_id=user_id, text="Автоматический подбор топовых сигналов включен!\nОстановить: /stop или кнопка ниже.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Остановить автопоиск", callback_data="stop_auto")], [InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]]))
+    await auto_futures_signals(user_id, context)
+
+async def auto_futures_signals(user_id, context):
+    # ищем лучшие входы по всем парам раз в час
+    while context.user_data.get('auto', False):
+        top_signals = []
+        for pair in FUTURES_PAIRS:
+            signal = analyze_pair(pair, budget=BUDGET_FUTURES, mode="futures")
+            if signal["quality"] > 7.5:  # только хорошие сигналы
+                top_signals.append((pair, signal))
+        top_signals.sort(key=lambda x: x[1]["quality"], reverse=True)
+        # отправляем топ-1 или топ-2
+        for pair, signal in top_signals[:2]:
+            comment = get_ai_comment(pair, signal)
+            msg = make_signal_message(signal, pair, "ФЬЮЧЕРСЫ (Auto)", comment)
+            await context.bot.send_message(chat_id=user_id, text=msg, parse_mode="HTML", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="main_menu")]]))
+        # ждать час
+        await asyncio.sleep(3600)
+
+# === СИГНАЛ-ГЕНЕРАТОР ===
+def analyze_pair(pair, budget, mode="futures"):
+    # Получаем цену (упрощённо)
     try:
-        exchange = exchanges["Binance"]
-        ticker = exchange.fetch_ticker(pair)
-        price = ticker['last']
-        vol = get_volatility(ticker)
-        change = ticker.get('percentage', 0)
-        volume = ticker['quoteVolume']
-        direction = "LONG" if change > 0 else "SHORT"
-        stop_loss_pct = 0.10
-        target_profit = 100  # $100
-        stop = round(price * (1 - stop_loss_pct if direction == "LONG" else 1 + stop_loss_pct), 4)
-        take = price + target_profit if direction == "LONG" else price - target_profit
-        if is_time_allowed():
-            comment = explain_signal(pair, direction, change, vol, volume)
-            text = (
-                f"⚡️ <b>Фьючерсы (Binance): {pair}</b>\n"
-                f"Плечо: <b>{FUTURES_LEVERAGE}x</b>\n"
-                f"Вход: <b>{price}</b>\n"
-                f"Тейк: <b>{round(take,2)}</b> | Стоп: <b>{round(stop,2)}</b>\n"
-                f"Направление: <b>{direction}</b>\n"
-                f"{comment}"
-            )
+        ticker = binance.fetch_ticker(pair)
+        price = float(ticker["last"])
+        spread = abs(price - float(ticker["open"]))
+        # Пример: расчёт плеча, стопа, тейка
+        if mode == "futures":
+            leverage = 5 if "BTC" in pair or "ETH" in pair else 10
+            direction = "LONG" if spread > 0 else "SHORT"
+            stop = round(price * (0.96 if direction == "LONG" else 1.04), 3)
+            take = round(price * (1.03 if direction == "LONG" else 0.97), 3)
         else:
-            text = "⚡️ Фьючерсные сигналы доступны только с 08:00 до 00:00 по Киеву/МСК."
+            leverage = 1
+            direction = "BUY"
+            stop = round(price * 0.98, 3)
+            take = round(price * 1.01, 3)
+        # Фиктивная оценка качества по волатильности
+        quality = min(10, max(0, (spread / price) * 120))
+        return {
+            "price": price, "direction": direction, "stop": stop,
+            "take": take, "leverage": leverage, "quality": quality,
+            "budget": budget
+        }
     except Exception as e:
-        text = f"Ошибка анализа {pair}: {e}"
-    keyboard = [[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]]
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+        return {
+            "price": 0, "direction": "NONE", "stop": 0, "take": 0, "leverage": 1, "quality": 0, "budget": budget
+        }
 
-# ==== ФЬЮЧЕРСЫ АВТО ====
-async def auto_futures_handler(update, context):
-    await update.callback_query.edit_message_text("⏳ Автопоиск лучших входов по фьючерсам...")
-    pairs = exchanges["Binance"].load_markets()
-    fut_pairs = [p for p in pairs if "/USDT" in p and pairs[p]['future'] and pairs[p]['active'] and pairs[p]['quote'] == "USDT"]
-    signals = []
-    for pair in fut_pairs:
-        try:
-            ticker = exchanges["Binance"].fetch_ticker(pair)
-            price = ticker['last']
-            vol = get_volatility(ticker)
-            change = ticker.get('percentage', 0)
-            volume = ticker['quoteVolume']
-            direction = "LONG" if change > 0 else "SHORT"
-            stop_loss_pct = 0.10
-            target_profit = 100
-            stop = round(price * (1 - stop_loss_pct if direction == "LONG" else 1 + stop_loss_pct), 4)
-            take = price + target_profit if direction == "LONG" else price - target_profit
-            if is_time_allowed() and abs(change) > 1 and volume > 1_000_000:
-                comment = explain_signal(pair, direction, change, vol, volume)
-                signals.append({
-                    "pair": pair, "price": price, "direction": direction,
-                    "take": take, "stop": stop, "comment": comment
-                })
-        except Exception as e:
-            continue
-
-    if signals:
-        text = "<b>Топ фьючерсные сигналы (Binance):</b>\n\n"
-        for s in signals:
-            text += (
-                f"{s['pair']} | {s['direction']}\n"
-                f"Вход: {s['price']}\n"
-                f"Тейк: {round(s['take'],2)} | Стоп: {round(s['stop'],2)}\n"
-                f"{s['comment']}\n\n"
-            )
-        keyboard = [[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]]
-        await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
-    else:
-        await update.callback_query.edit_message_text(
-            "Сейчас нет топовых сигналов по твоим условиям. Попробуй позже.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]])
+# === AI-КОММЕНТАРИЙ ===
+def get_ai_comment(pair, signal):
+    prompt = f"""
+Ты трейдер. Проанализируй и прокомментируй сигнал для {pair} на {signal['direction']}:
+- Цена: {signal['price']}
+- Плечо: {signal['leverage']}
+- Стоп: {signal['stop']}
+- Тейк: {signal['take']}
+- Качество: {signal['quality']}
+- Бюджет: {signal['budget']}
+Напиши, почему этот сигнал может быть хорошим или плохим, укажи сильные и слабые стороны, оцени вероятность успеха.
+"""
+    try:
+        response = openai.ChatCompletion.create(
+            model="gpt-4o",
+            messages=[{"role": "system", "content": "Ты опытный криптотрейдер."}, {"role": "user", "content": prompt}],
+            max_tokens=90,
+            temperature=0.5
         )
+        return response.choices[0].message["content"]
+    except Exception:
+        return "Комментарий временно недоступен."
 
-# ==== ОТЧЁТ ====
-async def portfolio_handler(update, context):
-    user_id = update.callback_query.message.chat_id
-    cursor.execute("SELECT * FROM signals_log WHERE user_id = ?", (user_id,))
-    rows = cursor.fetchall()
-    cnt = len(rows)
-    avg = round(sum([row[8] for row in rows]) / cnt, 2) if cnt > 0 else 0
-    text = (
-        f"🗂 <b>Ваш отчёт:</b>\n"
-        f"- Получено сигналов: <b>{cnt}</b>\n"
-        f"- Средний результат по сделке: <b>{avg}$</b>\n"
-        f"- Стратегия: тейк частями, стоп строго!\n"
-        f"<i>Журнал сигналов скоро станет доступен прямо в боте!</i>"
-    )
-    keyboard = [[InlineKeyboardButton("⬅️ В меню", callback_data="back:menu")]]
-    await update.callback_query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode="HTML")
+# === ФОРМАТ СИГНАЛА ===
+def make_signal_message(signal, pair, typ, comment):
+    return (f"<b>⚡ {typ} ({pair})</b>\n"
+            f"Плечо: <b>{signal['leverage']}</b>\n"
+            f"Вход: <b>{signal['price']}</b>\n"
+            f"Тейк: <b>{signal['take']}</b> | Стоп: <b>{signal['stop']}</b>\n"
+            f"Направление: <b>{signal['direction']}</b>\n"
+            f"Качество сигнала: <b>{signal['quality']:.1f}/10</b>\n"
+            f"<i>{comment}</i>")
 
-# ==== ЕЖЕЧАСНЫЕ АВТОСИГНАЛЫ (по расписанию, топовые спот+фьючи) ====
-async def hourly_signals_job(context: ContextTypes.DEFAULT_TYPE):
-    chat_ids = []
-    cursor.execute("SELECT user_id FROM tokens WHERE user_id IS NOT NULL")
-    for row in cursor.fetchall():
-        chat_ids.append(row[0])
-    for chat_id in chat_ids:
-        # Спот
-        try:
-            pairs = spot_exchange.load_markets()
-            spot_pairs = [s for s in pairs if "/USDT" in s and not pairs[s]['future'] and pairs[s]['active'] and pairs[s]['quote'] == "USDT"]
-            spot_pairs = sorted(spot_pairs, key=lambda x: -pairs[x]['info'].get('quoteVolume', 0))[:20]
-            best_signal = None
-            best_score = -999
-            for pair in spot_pairs:
-                try:
-                    ticker = spot_exchange.fetch_ticker(pair)
-                    price = ticker['last']
-                    vol = get_volatility(ticker)
-                    change = ticker.get('percentage', 0)
-                    score = change * vol * ticker['quoteVolume']
-                    if score > best_score:
-                        best_score = score
-                        best_signal = {
-                            "pair": pair, "price": price, "change": change, "vol": vol, "score": score
-                        }
-                except: continue
-            if best_signal:
-                direction = "LONG" if best_signal["change"] > 0 else "SHORT"
-                stop_loss_pct = 0.03
-                stop = round(best_signal["price"] * (1 - stop_loss_pct if direction == "LONG" else 1 + stop_loss_pct), 4)
-                take = best_signal["price"] + 50 if direction == "LONG" else best_signal["price"] - 50
-                comment = explain_signal(
-                    best_signal["pair"], direction, best_signal["change"], best_signal["vol"], best_signal["score"]
-                )
-                text = (
-                    f"⏰ <b>Ежечасный сигнал на спот (Binance)</b>\n"
-                    f"Пара: <b>{best_signal['pair']}</b>\n"
-                    f"Цена: <b>{best_signal['price']}</b>\n"
-                    f"Тейк: <b>{round(take,2)}</b> | Стоп: <b>{round(stop,2)}</b>\n"
-                    f"Изменение: <b>{round(best_signal['change'],2)}%</b>\n"
-                    f"Волатильность: <b>{round(best_signal['vol'],4)}</b>\n"
-                    f"{comment}\n"
-                )
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        except: pass
-        # Фьючерсы
-        try:
-            pairs = exchanges["Binance"].load_markets()
-            fut_pairs = [p for p in pairs if "/USDT" in p and pairs[p]['future'] and pairs[p]['active'] and pairs[p]['quote'] == "USDT"]
-            best_signal = None
-            best_score = -999
-            for pair in fut_pairs:
-                try:
-                    ticker = exchanges["Binance"].fetch_ticker(pair)
-                    vol = get_volatility(ticker)
-                    price = ticker['last']
-                    change = ticker.get('percentage', 0)
-                    score = abs(change) * vol * ticker['quoteVolume']
-                    if score > best_score:
-                        best_score = score
-                        best_signal = {
-                            "pair": pair, "price": price, "change": change, "vol": vol, "score": score
-                        }
-                except: continue
-            if best_signal and is_time_allowed():
-                direction = "LONG" if best_signal["change"] > 0 else "SHORT"
-                stop_loss_pct = 0.10
-                stop = round(best_signal["price"] * (1 - stop_loss_pct if direction == "LONG" else 1 + stop_loss_pct), 4)
-                take = best_signal["price"] + 100 if direction == "LONG" else best_signal["price"] - 100
-                comment = explain_signal(
-                    best_signal["pair"], direction, best_signal["change"], best_signal["vol"], best_signal["score"]
-                )
-                text = (
-                    f"⏰ <b>Ежечасный автосигнал (Binance Фьючерсы)</b>\n"
-                    f"Пара: <b>{best_signal['pair']}</b>\n"
-                    f"Плечо: <b>{FUTURES_LEVERAGE}x</b>\n"
-                    f"Вход: <b>{best_signal['price']}</b>\n"
-                    f"Тейк: <b>{round(take,2)}</b> | Стоп: <b>{round(stop,2)}</b>\n"
-                    f"Направление: <b>{direction}</b>\n"
-                    f"Волатильность: <b>{round(best_signal['vol'],4)}</b>\n"
-                    f"{comment}\n"
-                )
-                await context.bot.send_message(chat_id=chat_id, text=text, parse_mode="HTML")
-        except: pass
-
-# ==== MAIN ====
+# === MAIN ===
 def main():
-    application = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("generate_token", generate_token))
-    application.add_handler(CommandHandler("activate", activate_token))
-    application.add_handler(CallbackQueryHandler(button_handler))
-    application.job_queue.run_repeating(hourly_signals_job, interval=3600, first=15)
-    application.run_polling()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("generate_token", generate_token))
+    app.add_handler(CommandHandler("activate", activate_token))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.run_polling()
 
 if __name__ == "__main__":
+    import asyncio
     main()
