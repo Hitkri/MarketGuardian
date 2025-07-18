@@ -15,10 +15,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 # from sklearn.preprocessing import MinMaxScaler  # Removed dependency
 
-import dash
-import dash_table
-import dash_core_components as dcc
-import dash_html_components as html
+# Dash dashboard removed - not installed
 
 # === PHASE 6: BOT WITH CCXT POLLING & DASHBOARD ===
 
@@ -200,16 +197,8 @@ async def process_symbol(app, sym, mode):
             await app.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
             record_trade(uid, mode, sym, sig['direction'], sig['price'], 0)
 
-# === DASHBOARD ===
-def run_dashboard():
-    app_dash = dash.Dash(__name__)
-    df = pd.read_sql('SELECT * FROM trades ORDER BY timestamp DESC LIMIT 50', conn)
-    app_dash.layout = html.Div([
-        html.H2('Recent Trades'),
-        dash_table.DataTable(columns=[{'name':c,'id':c} for c in df.columns], data=df.to_dict('records'), page_size=10),
-        dcc.Interval(id='interval', interval=60000, n_intervals=0)
-    ])
-    app_dash.run_server(host='0.0.0.0', port=8050)
+# === DASHBOARD REMOVED ===
+# Dashboard feature disabled
 
 # === TELEGRAM HANDLERS ===
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -243,7 +232,8 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
 async def main():
-    Thread(target=run_dashboard,daemon=True).start()
+    # Dashboard thread removed
+.start()
     app=ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('generate_token',generate_token)); app.add_handler(CommandHandler('activate',activate)); app.add_handler(CallbackQueryHandler(button_handler))
     scheduler=AsyncIOScheduler(); scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)),'interval',seconds=30); scheduler.start()
