@@ -244,9 +244,11 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     uid = update.effective_chat.id
     if data in ('spot', 'futures'):
-        # Immediate scan for selected mode
+        # Notify user and run scan
+        await context.bot.send_message(uid, "Запускаю сканирование…")
         await monitor_markets(context.application)
-        await update.callback_query.answer('Scanning market...')
+        await context.bot.send_message(uid, "Сканирование завершено.")
+        await update.callback_query.answer()
     else:
         parts = data.split('_')
         if parts[0] == 'monitor':
