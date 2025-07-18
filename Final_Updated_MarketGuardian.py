@@ -202,64 +202,90 @@ async def process_symbol(app, sym, mode):
 
 # === TELEGRAM HANDLERS ===
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton('🟢 Spot Signals', callback_data='spot')],
-        [InlineKeyboardButton('🔴 Futures Signals', callback_data='futures')]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        await update.message.reply_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
-        await main_menu(update, context)
-    else:
-        await update.message.reply_text('Use /activate <token>')
-
-async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return await update.message.reply_text('Forbidden')
-    token = str(uuid.uuid4())
-    cursor.execute('INSERT INTO tokens(token) VALUES(?)', (token,))
-    conn.commit()
-    await update.message.reply_text(f'Token: {token}')
-
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if len(context.args) != 1:
-        return await update.message.reply_text('Use /activate <token>')
-    token = context.args[0]
-    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
-        return await update.message.reply_text('Invalid token')
-    cursor.execute('UPDATE tokens SET user_id=?, username=?, activation_time=? WHERE token=?',
-                   (uid, update.effective_user.username, time.time(), token))
-    conn.commit()
-    await main_menu(update, context)
-
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     uid = update.effective_chat.id
+    # User selects mode: show list of pairs
     if data in ('spot', 'futures'):
-        # Notify user and run scan
-        await context.bot.send_message(uid, "Запускаю сканирование…")
-        await monitor_markets(context.application)
-        await context.bot.send_message(uid, "Сканирование завершено.")
+        mode = data
+        # Build keyboard of pairs
+        pairs = SPOT_PAIRS if mode=='spot' else FUTURES_PAIRS
+        keyboard = []
+        for i in range(0, len(pairs), 2):
+            row = []
+            for j in range(2):
+                if i+j < len(pairs):
+                    sym = pairs[i+j]
+                    row.append(InlineKeyboardButton(sym, callback_data=f"pair_{mode}_{sym}"))
+            keyboard.append(row)
+        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='back')])
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        await update.callback_query.edit_message_text(
+            f"<b>Select {mode.capitalize()} Pair:</b>", parse_mode='HTML', reply_markup=reply_markup)
         await update.callback_query.answer()
-    else:
-        parts = data.split('_')
-        if parts[0] == 'monitor':
-            mode = parts[1]
-            sym = '_'.join(parts[2:])
-            sig = await generate_signal(sym, mode)
-            status = 'No signal' if not sig else f"{sig['direction']} at {sig['price']}"
-            await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
-            await update.callback_query.answer()
+        return
+    # Back to main menu
+    if data == 'back':
+        await main_menu(update, context)
+        await update.callback_query.answer()
+        return
+    # User selects a specific pair
+    if data.startswith('pair_'):
+        _, mode, sym = data.split('_', 2)
+        # Send initial analysis
+        await context.bot.send_message(uid, f"Analyzing {sym} on {mode}...", parse_mode='HTML')
+        sig = await generate_signal(sym, mode)
+        if not sig or not sig.get('signal'):
+            await context.bot.send_message(uid, f"No valid signal for {sym}.")
+        else:
+            msg, kb = format_signal(sig, mode)
+            await context.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
+        # Schedule continuous monitoring every minute
+        job_id = f"monitor_{uid}_{mode}_{sym}" 
+        # Remove existing job if any
+        try:
+            scheduler.remove_job(job_id)
+        except Exception:
+            pass
+        # Add new job
+        scheduler.add_job(
+            lambda job_uid=uid, job_mode=mode, job_sym=sym: asyncio.create_task(
+                process_symbol(context.application, job_sym, job_mode)
+            ),
+            'interval', minutes=1, id=job_id
+        )
+        await context.bot.send_message(uid, f"Started monitoring {sym} every minute.")
+        await update.callback_query.answer()
+        return
+    # Monitor action
+    parts = data.split('_')
+    if parts[0] == 'monitor':
+        mode = parts[1]
+        sym = '_'.join(parts[2:])
+        sig = await generate_signal(sym, mode)
+        status = 'No signal' if not sig else f"{sig['direction']} @ {sig['price']}"
+        await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
+        await update.callback_query.answer()
 
 # === MAIN ===
+# Initialize and start APScheduler
+scheduler = AsyncIOScheduler()
+scheduler.start()
+
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('generate_token', generate_token))
+    app.add_handler(CommandHandler('activate', activate))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    # Full market-wide monitor (optional)
+    scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30, id='global_monitor', replace_existing=True)
+
+    app.run_polling()
+
+if __name__ == '__main__':
+    main()
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
