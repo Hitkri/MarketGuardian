@@ -201,42 +201,19 @@ async def process_symbol(app, sym, mode):
 # Dashboard feature disabled
 
 # === TELEGRAM HANDLERS ===
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton('Spot', callback_data='spot')],[InlineKeyboardButton('Futures',callback_data='futures')]])
-    if update.message: await update.message.reply_text('Select:',reply_markup=kb)
-    else: await update.callback_query.edit_message_text('Select:',reply_markup=kb)
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid=update.effective_chat.id
-    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?',(uid,)).fetchone(): await main_menu(update,context)
-    else: await update.message.reply_text('Use /activate <token>')
-
-async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id!=ADMIN_ID: return await update.message.reply_text('Forbidden')
-    t=str(uuid.uuid4()); cursor.execute('INSERT INTO tokens(token) VALUES(?)',(t,)); conn.commit(); await update.message.reply_text(f'Token:{t}')
-
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args)!=1: return await update.message.reply_text('Use /activate <token>')
-    t=context.args[0]
-    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL',(t,)).fetchone(): return await update.message.reply_text('Invalid')
-    cursor.execute('UPDATE tokens SET user_id=?,username=?,activation_time=? WHERE token=?',(update.effective_chat.id,update.effective_user.username,time.time(),t)); conn.commit(); await main_menu(update,context)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data=update.callback_query.data; uid=update.effective_chat.id
-    if data in ('spot','futures'): await monitor_markets(context.application); await update.callback_query.answer()
-    else:
-        act,mode,sym=data.split('_');
-        if act=='monitor': sig=await generate_signal(sym,mode);
-        status='No signal' if not sig else f"{sig['direction']}@{sig['price']}";
-        await context.bot.send_message(uid,status)
-        await update.callback_query.answer()
-
 async def main():
     # Dashboard thread removed
-.start()
-    app=ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('generate_token',generate_token)); app.add_handler(CommandHandler('activate',activate)); app.add_handler(CallbackQueryHandler(button_handler))
-    scheduler=AsyncIOScheduler(); scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)),'interval',seconds=30); scheduler.start()
+    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start', start))
+    app.add_handler(CommandHandler('generate_token', generate_token))
+    app.add_handler(CommandHandler('activate', activate))
+    app.add_handler(CallbackQueryHandler(button_handler))
+
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30)
+    scheduler.start()
+
     await app.run_polling()
 
-if __name__=='__main__': asyncio.run(main())
+if __name__ == '__main__':
+    asyncio.run(main())=='__main__': asyncio.run(main())
