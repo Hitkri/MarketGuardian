@@ -202,7 +202,45 @@ async def process_symbol(app, sym, mode):
 
 # === TELEGRAM HANDLERS ===
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton('🟢 Spot Signals', callback_data='spot')],
+        [InlineKeyboardButton('🔴 Futures Signals', callback_data='futures')],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
+        await main_menu(update, context)
+    else:
+        await update.message.reply_text('Use /activate <token>')
+
+async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_chat.id != ADMIN_ID:
+        return await update.message.reply_text('Forbidden')
+    token = str(uuid.uuid4())
+    cursor.execute('INSERT INTO tokens(token) VALUES(?)', (token,))
+    conn.commit()
+    await update.message.reply_text(f'Token: {token}')
+
+async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if len(context.args) != 1:
+        return await update.message.reply_text('Use /activate <token>')
+    token = context.args[0]
+    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
+        return await update.message.reply_text('Invalid token')
+    cursor.execute('UPDATE tokens SET user_id=?, username=?, activation_time=? WHERE token=?',
+                   (uid, update.effective_user.username, time.time(), token))
+    conn.commit()
+    await main_menu(update, context)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     uid = update.effective_chat.id
     # User selects mode: show list of pairs
