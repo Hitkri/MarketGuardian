@@ -240,7 +240,7 @@ async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     await main_menu(update, context)
 
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = update.callback_query.data
     uid = update.effective_chat.id
     # User selects mode: show list of pairs
@@ -319,21 +319,6 @@ def main():
 
     # Full market-wide monitor (optional)
     scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30, id='global_monitor', replace_existing=True)
-
-    app.run_polling()
-
-if __name__ == '__main__':
-    main()
-def main():
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('generate_token', generate_token))
-    app.add_handler(CommandHandler('activate', activate))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30)
-    scheduler.start()
 
     app.run_polling()
 
