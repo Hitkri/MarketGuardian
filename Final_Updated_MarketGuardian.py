@@ -11,7 +11,8 @@ from threading import Thread
 import pandas as pd
 import numpy as np
 import openai
-import praw
+# import praw  # Removed - not installed
+
 import tensorflow as tf
 from binance import AsyncClient, BinanceSocketManager
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -75,7 +76,8 @@ lstm_models = {}
 scalers = {}
 
 # === REDDIT CLIENT ===
-reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
+# Reddit client unavailable - sentiment disabled
+# reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
 
 # === WEBSOCKET LISTENER ===
 async def ws_listener(app):
@@ -193,21 +195,8 @@ def fetch_onchain(symbol):
 
 # === SENTIMENT via Reddit ===
 def fetch_reddit_sentiment(symbol):
-    texts = []
-    for submission in reddit.subreddit('cryptocurrency').search(symbol, limit=20):
-        texts.append(submission.title + ' ' + submission.selftext)
-    if not texts:
-        return 0
-    prompt = 'Analyze sentiment:' + '\n'.join(texts)
-    resp = openai.ChatCompletion.create(
-        model='gpt-4o',
-        messages=[{'role':'system','content':'You are sentiment analyzer.'}, {'role':'user','content':prompt}],
-        max_tokens=50
-    )
-    try:
-        return float(resp.choices[0].message.content.strip().split()[0])
-    except:
-        return 0
+    # Sentiment analysis disabled due to missing praw
+    return 0
 
 # === SIGNAL GENERATION PHASES 1-5 ===
 def generate_signal(symbol, mode='spot'):
