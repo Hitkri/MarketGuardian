@@ -53,11 +53,8 @@ cursor.execute('CREATE TABLE IF NOT EXISTS last_signals (mode TEXT, symbol TEXT 
 conn.commit()
 
 # === EXCHANGE INIT ===
-exchange = ccxt_binance({
-    'apiKey': BINANCE_API_KEY,
-    'secret': BINANCE_SECRET,
-    'enableRateLimit': True,
-})
+# Use public endpoints only (no API key required for fetching OHLCV)
+exchange = ccxt_binance({'enableRateLimit': True})
 
 # === INDICATORS ===
 def compute_rsi(df, period=14):
