@@ -13,27 +13,22 @@ import numpy as np
 import openai
 # import praw  # Removed - not installed
 
-import tensorflow as tf
+# import tensorflow as tf  # Removed due to missing tensorflow in environment
 from binance import AsyncClient, BinanceSocketManager
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense
 from sklearn.preprocessing import MinMaxScaler
+
+# Removed TensorFlow/Keras LSTM dependencies for forecasting; using linear trend forecasting instead
 import dash
 import dash_table
 import dash_core_components as dcc
 import dash_html_components as html
 
 # === PHASE 6: FULLY INTEGRATED BOT WITH DASHBOARD & FREE APIs ===
-# GPU memory growth
-gpus = tf.config.experimental.list_physical_devices('GPU')
-if gpus:
-    for gpu in gpus:
-        tf.config.experimental.set_memory_growth(gpu, True)
-
-# === API KEYS & TOKENS ===
+# GPU memory growth removed - no tensorflow available
+# === API KEYS & TOKENS & TOKENS ===
 TELEGRAM_BOT_TOKEN = "7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0"
 ADMIN_ID = 1407143951
 BINANCE_API_KEY = "your_binance_api_key"
@@ -150,38 +145,14 @@ def compute_vwap(df):
     tp = (df['high'] + df['low'] + df['close']) / 3
     return (tp * df['volume']).cumsum() / df['volume'].cumsum()
 
-# === LSTM TRAIN & PREDICT ===
-def train_lstm(symbol, tf_key):
-    buf = candle_cache[symbol][tf_key]
-    df = pd.DataFrame(buf).set_index('timestamp')
-    closes = df['close'].values.reshape(-1, 1)
-    scaler = MinMaxScaler()
-    scaled = scaler.fit_transform(closes)
-    X, y = [], []
-    for i in range(len(scaled) - LSTM_LOOKBACK):
-        X.append(scaled[i:i + LSTM_LOOKBACK, 0])
-        y.append(scaled[i + LSTM_LOOKBACK, 0])
-    X, y = np.array(X), np.array(y)
-    X = X.reshape((X.shape[0], X.shape[1], 1))
-    model = Sequential([LSTM(50, input_shape=(LSTM_LOOKBACK, 1)), Dense(1)])
-    model.compile(optimizer='adam', loss='mse')
-    model.fit(X, y, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH, verbose=0)
-    lstm_models[(symbol, tf_key)] = model
-    scalers[(symbol, tf_key)] = scaler
-
-def predict_lstm(symbol, tf_key):
-    key = (symbol, tf_key)
-    buf = candle_cache[symbol][tf_key]
-    df = pd.DataFrame(buf).set_index('timestamp')
-    closes = df['close'].values.reshape(-1, 1)
-    if key not in lstm_models:
-        train_lstm(symbol, tf_key)
-    scaler = scalers[key]
-    model = lstm_models[key]
-    scaled = scaler.transform(closes)
-    seq = scaled[-LSTM_LOOKBACK:].reshape((1, LSTM_LOOKBACK, 1))
-    pred = model.predict(seq, verbose=0)
-    return float(scaler.inverse_transform(pred)[0, 0])
+# === FORECASTING FUNCTION ===
+def forecast_next(df):
+    y = df['close'].values
+    x = np.arange(len(y))
+    if len(x) < 2:
+        return y[-1] if len(y) else 0
+    coeffs = np.polyfit(x, y, 1)
+    return float(coeffs[0] * len(x) + coeffs[1])
 
 # === FUNDAMENTALS via Covalent ===
 def fetch_onchain(symbol):
@@ -199,6 +170,8 @@ def fetch_reddit_sentiment(symbol):
     return 0
 
 # === SIGNAL GENERATION PHASES 1-5 ===
+# Using linear forecasting instead of LSTM
+
 def generate_signal(symbol, mode='spot'):
     onchain = fetch_onchain(symbol)
     sentiment = fetch_reddit_sentiment(symbol)
