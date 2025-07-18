@@ -13,7 +13,8 @@ from ccxt.async_support import binance as ccxt_binance
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from sklearn.preprocessing import MinMaxScaler
+# from sklearn.preprocessing import MinMaxScaler  # Removed dependency
+
 import dash
 import dash_table
 import dash_core_components as dcc
