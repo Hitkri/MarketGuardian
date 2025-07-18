@@ -324,10 +324,23 @@ def run_dashboard():
     dash_app.run_server(host='0.0.0.0', port=8050)
 
 # === TELEGRAM HANDLERS ===
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [InlineKeyboardButton("🟢 Spot Signals", callback_data="spot")],
+        [InlineKeyboardButton("🔴 Futures Signals", callback_data="futures")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    if update.message:
+        await update.message.reply_text("<b>Select Mode:</b>", parse_mode='HTML', reply_markup=reply_markup)
+    else:
+        await update.callback_query.edit_message_text("<b>Select Mode:</b>", parse_mode='HTML', reply_markup=reply_markup)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
-    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?',(uid,)).fetchone():
-        await update.message.reply_text(f'Bot running. Dashboard: http://<SERVER_IP>:8050')
+    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
+        # Show main menu for authorized users
+        await main_menu(update, context)
     else:
         await update.message.reply_text('Activate: /activate <token>')
 
@@ -345,18 +358,28 @@ async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = context.args[0]
     if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
         return await update.message.reply_text('Invalid token')
-    cursor.execute('UPDATE tokens SET user_id=?,username=?,activation_time=? WHERE token=?', (update.effective_chat.id, update.effective_user.username, time.time(), token))
+    cursor.execute('UPDATE tokens SET user_id=?,username=?,activation_time=? WHERE token=?',
+                   (update.effective_chat.id, update.effective_user.username, time.time(), token))
     conn.commit()
-    await update.message.reply_text('Activated! Signals will start.')
+    # After activation, show menu
+    await main_menu(update, context)
 
-async def button_handler(update: Update, context: Contextypes.DEFAULT_TYPE):
-    action, mode, sym = update.callback_query.data.split('_')
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
     uid = update.effective_chat.id
-    if action == 'monitor':
-        sig = generate_signal(sym, mode)
-        status = 'No signal' if not sig else f"{sig['direction']} at {sig['price']}"
-        await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
-    await update.callback_query.answer()
+    if data in ('spot', 'futures'):
+        # user selected mode, send initial signal now
+        mode = data
+        await process_symbol(app=context.application, sym=None, mode=mode)  # Immediate scan; sym=None means all
+        await update.callback_query.answer()
+    else:
+        parts = data.split('_')
+        action, mode, sym = parts[0], parts[1], '_'.join(parts[2:])
+        if action == 'monitor':
+            sig = generate_signal(sym, mode)
+            status = 'No signal' if not sig else f"{sig['direction']} at {sig['price']}"
+            await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
+        await update.callback_query.answer()
 
 # === MAIN ===
 async def main():
