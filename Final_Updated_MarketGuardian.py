@@ -318,7 +318,14 @@ def main():
     app.add_handler(CallbackQueryHandler(button_handler))
 
     # Full market-wide monitor (optional)
-    scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30, id='global_monitor', replace_existing=True)
+    scheduler.add_job(
+        monitor_markets,
+        'interval',
+        seconds=30,
+        args=[app],
+        id='global_monitor',
+        replace_existing=True
+    )
 
     app.run_polling()
 
