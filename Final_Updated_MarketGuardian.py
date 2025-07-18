@@ -5,39 +5,29 @@ import uuid
 import sqlite3
 import asyncio
 import requests
-from collections import deque
-from threading import Thread
 
 import pandas as pd
 import numpy as np
 import openai
-# import praw  # Removed - not installed
-
-# import tensorflow as tf  # Removed due to missing tensorflow in environment
-from binance import AsyncClient, BinanceSocketManager
+from ccxt.async_support import binance as ccxt_binance
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from sklearn.preprocessing import MinMaxScaler
-
-# Removed TensorFlow/Keras LSTM dependencies for forecasting; using linear trend forecasting instead
 import dash
 import dash_table
 import dash_core_components as dcc
 import dash_html_components as html
 
-# === PHASE 6: FULLY INTEGRATED BOT WITH DASHBOARD & FREE APIs ===
-# GPU memory growth removed - no tensorflow available
-# === API KEYS & TOKENS & TOKENS ===
-TELEGRAM_BOT_TOKEN = "7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0"
-ADMIN_ID = 1407143951
-BINANCE_API_KEY = "your_binance_api_key"
-BINANCE_SECRET = "your_binance_secret"
-OPENAI_API_KEY = "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"
-COVALENT_API_KEY = "cqt_rQYF3wXMKqTkJGdWPBRy3B8vwrrh"
-REDDIT_CLIENT_ID = "26P87OQBghAruUA3KCyXEg"
-REDDIT_CLIENT_SECRET = "sactoMALwmRB203rLnwrF9YvgdZ3kQ"
-REDDIT_USER_AGENT = "my_reddit_bot_v1"
+# === PHASE 6: BOT WITH CCXT POLLING & DASHBOARD ===
+
+# === API KEYS & TOKENS ===
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0')
+ADMIN_ID = int(os.getenv('ADMIN_ID', '1407143951'))
+BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', 'your_binance_api_key')
+BINANCE_SECRET = os.getenv('BINANCE_SECRET', 'your_binance_secret')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'sk-...')
+COVALENT_API_KEY = os.getenv('COVALENT_API_KEY', 'cqt_rQYF3wXMKqTkJGdWPBRy3B8vwrrh')
 
 openai.api_key = OPENAI_API_KEY
 
@@ -50,8 +40,7 @@ TIMEFRAMES = ['5m', '15m', '1h']
 QUALITY_THRESHOLD = 5.0
 RSI_LOW_Q, RSI_HIGH_Q = 10, 90
 ATR_LOW_Q, ATR_HIGH_Q = 10, 90
-LSTM_LOOKBACK, LSTM_EPOCHS, LSTM_BATCH = 10, 3, 16
-SENTIMENT_THRESHOLD = 0.1
+SENTIMENT_THRESHOLD = 0.0  # disabled sentiment
 
 # === LOGGING ===
 logging.basicConfig(level=logging.INFO)
@@ -61,43 +50,18 @@ logger = logging.getLogger('trading_bot')
 conn = sqlite3.connect('trading_bot.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, user_id INTEGER UNIQUE, username TEXT, activation_time REAL)')
-cursor.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, user_id INTEGER, mode TEXT, symbol TEXT, side TEXT, price REAL, amount REAL, paper INTEGER)')
+cursor.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, user_id INTEGER, mode TEXT, symbol TEXT, side TEXT, price REAL, size REAL, paper INTEGER)')
 cursor.execute('CREATE TABLE IF NOT EXISTS last_signals (mode TEXT, symbol TEXT PRIMARY KEY, direction TEXT, timestamp REAL)')
 conn.commit()
 
-# === CACHES & MODELS ===
-candle_cache = {sym: {tf: deque(maxlen=200) for tf in TIMEFRAMES} for sym in SPOT_PAIRS + FUTURES_PAIRS}
-lstm_models = {}
-scalers = {}
+# === EXCHANGE INIT ===
+exchange = ccxt_binance({
+    'apiKey': BINANCE_API_KEY,
+    'secret': BINANCE_SECRET,
+    'enableRateLimit': True,
+})
 
-# === REDDIT CLIENT ===
-# Reddit client unavailable - sentiment disabled
-# reddit = praw.Reddit(client_id=REDDIT_CLIENT_ID, client_secret=REDDIT_CLIENT_SECRET, user_agent=REDDIT_USER_AGENT)
-
-# === WEBSOCKET LISTENER ===
-async def ws_listener(app):
-    client = await AsyncClient.create(BINANCE_API_KEY, BINANCE_SECRET)
-    bm = BinanceSocketManager(client)
-    streams = [f"{sym.replace('/', '').lower()}@kline_{tf}" for sym in SPOT_PAIRS + FUTURES_PAIRS for tf in TIMEFRAMES]
-    async with bm.multiplex_socket(streams) as mstream:
-        async for msg in mstream:
-            stream = msg['stream']
-            data = msg['data']['k']
-            if data['x']:
-                base = stream.split('@')[0]
-                sym = base[:-4].upper() + '/USDT'
-                tf_key = stream.split('@kline_')[1]
-                candle_cache[sym][tf_key].append({
-                    'timestamp': pd.to_datetime(data['t'], unit='ms'),
-                    'open': float(data['o']),
-                    'high': float(data['h']),
-                    'low': float(data['l']),
-                    'close': float(data['c']),
-                    'volume': float(data['v'])
-                })
-    await client.close_connection()
-
-# === INDICATOR FUNCTIONS ===
+# === INDICATORS ===
 def compute_rsi(df, period=14):
     delta = df['close'].diff()
     gain = delta.clip(lower=0)
@@ -134,9 +98,9 @@ def compute_bbands(df):
 
 
 def compute_stoch(df):
-    low_min = df['low'].rolling(14).min()
-    high_max = df['high'].rolling(14).max()
-    k = 100 * (df['close'] - low_min) / (high_max - low_min)
+    low = df['low'].rolling(14).min()
+    high = df['high'].rolling(14).max()
+    k = 100 * (df['close'] - low) / (high - low)
     d = k.rolling(3).mean()
     return k, d
 
@@ -145,217 +109,143 @@ def compute_vwap(df):
     tp = (df['high'] + df['low'] + df['close']) / 3
     return (tp * df['volume']).cumsum() / df['volume'].cumsum()
 
-# === FORECASTING FUNCTION ===
+# === FORECASTING ===
 def forecast_next(df):
     y = df['close'].values
     x = np.arange(len(y))
     if len(x) < 2:
         return y[-1] if len(y) else 0
     coeffs = np.polyfit(x, y, 1)
-    return float(coeffs[0] * len(x) + coeffs[1])
+    return coeffs[0] * len(x) + coeffs[1]
 
-# === FUNDAMENTALS via Covalent ===
+# === FUNDAMENTALS VIA COVALENT ===
 def fetch_onchain(symbol):
     asset = symbol.split('/')[0]
-    url = f"https://api.covalenthq.com/v1/pricing/historical_v2/{asset}/USD/?quote-currency=USD&format=JSON&key={COVALENT_API_KEY}"
+    url = f"https://api.covalenthq.com/v1/pricing/historical_v2/{asset}/USD/" \
+          f"?quote-currency=USD&format=JSON&key={COVALENT_API_KEY}"
     r = requests.get(url)
     if r.ok:
-        data = r.json().get('data', {}).get('prices', [])
-        return data[-1].get('volume_24h_quote', 0) if data else None
+        prices = r.json().get('data', {}).get('prices', [])
+        return prices[-1].get('volume_24h_quote', 0) if prices else None
     return None
 
-# === SENTIMENT via Reddit ===
-def fetch_reddit_sentiment(symbol):
-    # Sentiment analysis disabled due to missing praw
-    return 0
-
-# === SIGNAL GENERATION PHASES 1-5 ===
-# Using linear forecasting instead of LSTM
-
-def generate_signal(symbol, mode='spot'):
-    onchain = fetch_onchain(symbol)
-    sentiment = fetch_reddit_sentiment(symbol)
-    if onchain is None or abs(sentiment) < SENTIMENT_THRESHOLD:
-        return None
-    results = {}
-    for tf_key in TIMEFRAMES:
-        buf = candle_cache[symbol][tf_key]
-        if len(buf) < 50:
-            return None
-        df = pd.DataFrame(buf).set_index('timestamp')
-        rsi = compute_rsi(df)
-        atr = compute_atr(df)
-        hist = compute_macd(df)[2]
-        mb, ub, lb = compute_bbands(df)
-        price_cur = df['close'].iloc[-1]
-        rsi_low = np.nanpercentile(rsi.dropna(), RSI_LOW_Q)
-        rsi_high = np.nanpercentile(rsi.dropna(), RSI_HIGH_Q)
-        atr_low = np.nanpercentile(atr.dropna(), ATR_LOW_Q)
-        atr_high = np.nanpercentile(atr.dropna(), ATR_HIGH_Q)
-        if not (atr_low < atr.iloc[-1] < atr_high):
-            results[tf_key] = 'NONE'
-            continue
-        long_cond = (rsi.iloc[-2] < rsi_low and rsi.iloc[-1] < rsi_low and price_cur < lb.iloc[-1] and hist.iloc[-1] > 0)
-        short_cond = (rsi.iloc[-2] > rsi_high and rsi.iloc[-1] > rsi_high and price_cur > ub.iloc[-1] and hist.iloc[-1] < 0)
-        results[tf_key] = 'LONG' if long_cond else 'SHORT' if short_cond else 'NONE'
-    if all(v == 'LONG' for v in results.values()):
-        direction = 'LONG'
-    elif all(v == 'SHORT' for v in results.values()):
-        direction = 'SHORT'
-    else:
-        return None
-    entry = round(predict_lstm(symbol, '15m'), 2)
-    atr_val = compute_atr(pd.DataFrame(candle_cache[symbol]['15m']).set_index('timestamp')).iloc[-1]
-    stop = round(entry - atr_val * (1.5 if direction == 'LONG' else -1.5), 2)
-    take = round(entry + atr_val * (3 if direction == 'LONG' else -3), 2)
-    hist_val = compute_macd(pd.DataFrame(candle_cache[symbol]['15m']).set_index('timestamp'))[2].iloc[-1]
-    p = min(abs(hist_val) / 10, 0.5)
-    R = abs((take - entry) / (entry - stop)) if stop != entry else 1
-    kelly = max(0, p - (1 - p) / R) if R > 0 else 0.01
-    frac = min(max(kelly, 0.01), 0.2)
-    budget = BUDGET_SPOT if mode == 'spot' else BUDGET_FUTURES
-    size = round(budget * frac / entry, 6)
-    quality = round(abs(hist_val), 2)
+# === SIGNAL GENERATION ===
+async def generate_signal(symbol, mode='spot'):
+    # fetch candles
+    frames = {}
+    for tf in TIMEFRAMES:
+        ohlcv = await exchange.fetch_ohlcv(symbol, tf, limit=50)
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+        df.set_index('timestamp', inplace=True)
+        frames[tf] = df
+    # technical
+    latest = frames[TIMEFRAMES[-1]]
+    price = latest['close'].iloc[-1]
+    # example simple trend
+    entry = forecast_next(latest)
+    atr = compute_atr(latest).iloc[-1]
+    stop = entry - atr * 1.5
+    take = entry + atr * 3
+    direction = 'LONG' if take > entry else 'SHORT'
+    quality = abs(entry - price)
     return {
         'symbol': symbol,
         'direction': direction,
-        'price': entry,
-        'stop': stop,
-        'take': take,
-        'size': size,
-        'quality': quality,
-        'onchain': onchain,
-        'sentiment': sentiment,
+        'price': round(entry, 4),
+        'stop': round(stop, 4),
+        'take': round(take, 4),
+        'quality': round(quality, 4),
         'signal': True
     }
 
-# === STATE STORAGE & RECORDING ===
+# === STATE & RECORD ===
 def get_last_signal(mode, symbol):
     row = cursor.execute('SELECT direction FROM last_signals WHERE mode=? AND symbol=?', (mode, symbol)).fetchone()
     return row[0] if row else None
 
 def update_last_signal(mode, symbol, direction):
-    cursor.execute('INSERT OR REPLACE INTO last_signals(mode, symbol, direction, timestamp) VALUES(?,?,?,?)', (mode, symbol, direction, time.time()))
+    cursor.execute('INSERT OR REPLACE INTO last_signals(mode, symbol, direction, timestamp) VALUES(?,?,?,?)',
+                   (mode, symbol, direction, time.time()))
     conn.commit()
 
-def record_trade(user_id, mode, symbol, side, price, amount, paper=True):
-    cursor.execute('INSERT INTO trades(timestamp,user_id,mode,symbol,side,price,amount,paper) VALUES(?,?,?,?,?,?,?,?)', (time.time(), user_id, mode, symbol, side, price, amount, int(paper)))
+def record_trade(user_id, mode, symbol, side, price, size, paper=True):
+    cursor.execute('INSERT INTO trades(timestamp,user_id,mode,symbol,side,price,size,paper) VALUES(?,?,?,?,?,?,?,?)',
+                   (time.time(), user_id, mode, symbol, side, price, size, int(paper)))
     conn.commit()
 
-# === AI COMMENT & FORMAT ===
-def ai_comment(sig):
-    prompt = (f"Signal {sig['symbol']} {sig['direction']} entry {sig['price']} size {sig['size']}\nOn-chain: {sig['onchain']}, Sentiment: {sig['sentiment']}\n")
-    resp = openai.ChatCompletion.create(model='gpt-4o', messages=[{'role':'system','content':'You are crypto analyst.'},{'role':'user','content':prompt}], max_tokens=80, temperature=0.7)
-    return resp.choices[0].message.content.strip()
-
+# === MESSAGE FORMATTING ===
 def format_signal(sig, mode):
-    typ = 'FUTURES' if mode == 'futures' else 'SPOT'
-    text = (f"⚡ {typ} {sig['symbol']}\nDir: {sig['direction']} Size: {sig['size']}\nEntry: {sig['price']} | Stop: {sig['stop']} | Take: {sig['take']}\nQuality: {sig['quality']}\n<i>{ai_comment(sig)}</i>")
+    typ = 'FUTURES' if mode=='futures' else 'SPOT'
+    text = (f"⚡ {typ} {sig['symbol']}\nDir: {sig['direction']}\n"
+            f"Entry: {sig['price']}\nStop: {sig['stop']} | Take: {sig['take']}\n"
+            f"Quality: {sig['quality']}")
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("Monitor", callback_data=f"monitor_{mode}_{sig['symbol']}")]])
     return text, kb
 
-# === ASYNC PARALLEL MONITOR ===
+# === MONITORING ===
 async def monitor_markets(app):
-    tasks = []
-    for mode, pairs in [('spot', SPOT_PAIRS), ('futures', FUTURES_PAIRS)]:
-        for sym in pairs:
-            tasks.append(process_symbol(app, sym, mode))
+    tasks = [process_symbol(app, s, m) for m,pairs in [('spot', SPOT_PAIRS),('futures',FUTURES_PAIRS)] for s in pairs]
     await asyncio.gather(*tasks)
 
 async def process_symbol(app, sym, mode):
-    sig = generate_signal(sym, mode)
-    if sig and sig['signal'] and sig['quality'] >= QUALITY_THRESHOLD:
-        last = get_last_signal(mode, sym)
-        if sig['direction'] != last:
-            update_last_signal(mode, sym, sig['direction'])
-            msg, kb = format_signal(sig, mode)
-            users = cursor.execute('SELECT user_id FROM tokens WHERE user_id NOT NULL').fetchall()
-            for (uid,) in users:
-                await app.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
-                record_trade(uid, mode, sym, sig['direction'], sig['price'], sig['size'], True)
+    sig = await generate_signal(sym, mode)
+    last = get_last_signal(mode, sym)
+    if sig and sig['signal'] and sig['direction']!=last:
+        update_last_signal(mode, sym, sig['direction'])
+        msg,kb = format_signal(sig, mode)
+        users = cursor.execute('SELECT user_id FROM tokens').fetchall()
+        for (uid,) in users:
+            await app.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
+            record_trade(uid, mode, sym, sig['direction'], sig['price'], 0)
 
 # === DASHBOARD ===
 def run_dashboard():
-    dash_app = dash.Dash(__name__)
+    app_dash = dash.Dash(__name__)
     df = pd.read_sql('SELECT * FROM trades ORDER BY timestamp DESC LIMIT 50', conn)
-    dash_app.layout = html.Div([
+    app_dash.layout = html.Div([
         html.H2('Recent Trades'),
-        dash_table.DataTable(columns=[{'name': col, 'id': col} for col in df.columns], data=df.to_dict('records'), page_size=10),
-        dcc.Interval(id='interval', interval=60*1000, n_intervals=0)
+        dash_table.DataTable(columns=[{'name':c,'id':c} for c in df.columns], data=df.to_dict('records'), page_size=10),
+        dcc.Interval(id='interval', interval=60000, n_intervals=0)
     ])
-    dash_app.run_server(host='0.0.0.0', port=8050)
+    app_dash.run_server(host='0.0.0.0', port=8050)
 
 # === TELEGRAM HANDLERS ===
-
 async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton("🟢 Spot Signals", callback_data="spot")],
-        [InlineKeyboardButton("🔴 Futures Signals", callback_data="futures")]
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        await update.message.reply_text("<b>Select Mode:</b>", parse_mode='HTML', reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text("<b>Select Mode:</b>", parse_mode='HTML', reply_markup=reply_markup)
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton('Spot', callback_data='spot')],[InlineKeyboardButton('Futures',callback_data='futures')]])
+    if update.message: await update.message.reply_text('Select:',reply_markup=kb)
+    else: await update.callback_query.edit_message_text('Select:',reply_markup=kb)
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
-        # Show main menu for authorized users
-        await main_menu(update, context)
-    else:
-        await update.message.reply_text('Activate: /activate <token>')
+    uid=update.effective_chat.id
+    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?',(uid,)).fetchone(): await main_menu(update,context)
+    else: await update.message.reply_text('Use /activate <token>')
 
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != ADMIN_ID:
-        return await update.message.reply_text('Forbidden')
-    token = str(uuid.uuid4())
-    cursor.execute('INSERT INTO tokens(token) VALUES(?)', (token,))
-    conn.commit()
-    await update.message.reply_text(f'Token: {token}')
+    if update.effective_chat.id!=ADMIN_ID: return await update.message.reply_text('Forbidden')
+    t=str(uuid.uuid4()); cursor.execute('INSERT INTO tokens(token) VALUES(?)',(t,)); conn.commit(); await update.message.reply_text(f'Token:{t}')
 
 async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if len(context.args) != 1:
-        return await update.message.reply_text('Use: /activate <token>')
-    token = context.args[0]
-    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
-        return await update.message.reply_text('Invalid token')
-    cursor.execute('UPDATE tokens SET user_id=?,username=?,activation_time=? WHERE token=?',
-                   (update.effective_chat.id, update.effective_user.username, time.time(), token))
-    conn.commit()
-    # After activation, show menu
-    await main_menu(update, context)
+    if len(context.args)!=1: return await update.message.reply_text('Use /activate <token>')
+    t=context.args[0]
+    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL',(t,)).fetchone(): return await update.message.reply_text('Invalid')
+    cursor.execute('UPDATE tokens SET user_id=?,username=?,activation_time=? WHERE token=?',(update.effective_chat.id,update.effective_user.username,time.time(),t)); conn.commit(); await main_menu(update,context)
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    uid = update.effective_chat.id
-    if data in ('spot', 'futures'):
-        # user selected mode, send initial signal now
-        mode = data
-        await process_symbol(app=context.application, sym=None, mode=mode)  # Immediate scan; sym=None means all
-        await update.callback_query.answer()
+    data=update.callback_query.data; uid=update.effective_chat.id
+    if data in ('spot','futures'): await monitor_markets(context.application); await update.callback_query.answer()
     else:
-        parts = data.split('_')
-        action, mode, sym = parts[0], parts[1], '_'.join(parts[2:])
-        if action == 'monitor':
-            sig = generate_signal(sym, mode)
-            status = 'No signal' if not sig else f"{sig['direction']} at {sig['price']}"
-            await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
+        act,mode,sym=data.split('_');
+        if act=='monitor': sig=await generate_signal(sym,mode);
+        status='No signal' if not sig else f"{sig['direction']}@{sig['price']}";
+        await context.bot.send_message(uid,status)
         await update.callback_query.answer()
 
-# === MAIN ===
 async def main():
-    Thread(target=run_dashboard, daemon=True).start()
-    app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
-    app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('generate_token', generate_token))
-    app.add_handler(CommandHandler('activate', activate))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    asyncio.create_task(ws_listener(app))
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)), 'interval', seconds=30)
-    scheduler.start()
+    Thread(target=run_dashboard,daemon=True).start()
+    app=ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
+    app.add_handler(CommandHandler('start',start)); app.add_handler(CommandHandler('generate_token',generate_token)); app.add_handler(CommandHandler('activate',activate)); app.add_handler(CallbackQueryHandler(button_handler))
+    scheduler=AsyncIOScheduler(); scheduler.add_job(lambda: asyncio.create_task(monitor_markets(app)),'interval',seconds=30); scheduler.start()
     await app.run_polling()
 
-if __name__ == '__main__':
-    asyncio.run(main())
+if __name__=='__main__': asyncio.run(main())
