@@ -32,7 +32,14 @@ openai.api_key = OPENAI_API_KEY
 # === CONFIGURATION ===
 BUDGET_FUTURES = 500
 BUDGET_SPOT = 3000
-SPOT_PAIRS = ['BTC/USDT', 'ETH/USDT', 'SOL/USDT', 'BNB/USDT', 'XRP/USDT']
+# Top 20 spot pairs on Binance:
+SPOT_PAIRS = [
+    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
+    'ADA/USDT', 'DOGE/USDT', 'MATIC/USDT', 'DOT/USDT', 'LTC/USDT',
+    'LINK/USDT', 'BCH/USDT', 'AVAX/USDT', 'UNI/USDT', 'SHIB/USDT',
+    'TRX/USDT', 'ETC/USDT', 'FIL/USDT', 'NEAR/USDT', 'AXS/USDT'
+]
+# Use the same top 20 list for futures
 FUTURES_PAIRS = SPOT_PAIRS.copy()
 TIMEFRAMES = ['5m', '15m', '1h']
 QUALITY_THRESHOLD = 5.0
@@ -314,15 +321,8 @@ def main():
     app.add_handler(CommandHandler('activate', activate))
     app.add_handler(CallbackQueryHandler(button_handler))
 
-    # Full market-wide monitor (optional)
-    scheduler.add_job(
-        monitor_markets,
-        'interval',
-        seconds=30,
-        args=[app],
-        id='global_monitor',
-        replace_existing=True
-    )
+    # Global monitoring disabled; only track user-selected pairs
+
 
     app.run_polling()
 
