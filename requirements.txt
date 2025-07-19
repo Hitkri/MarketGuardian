@@ -8,3 +8,4 @@ tenacity==8.2.2
 openai
 apscheduler
 matplotlib
+mplfinance
