@@ -12,6 +12,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from io import BytesIO
+import ccxt
 
 # === API KEYS ===
 TELEGRAM_BOT_TOKEN = '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0'
@@ -35,6 +36,9 @@ active_positions = {}
 scheduler = AsyncIOScheduler()
 scheduler.start()
 
+# === BINANCE ===
+binance = ccxt.binance()
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text('Добро пожаловать! Напиши /menu')
 
@@ -52,7 +56,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if data.startswith('select_'):
         symbol = data.replace('select_', '')
         await context.bot.send_message(uid, f'🔍 Анализирую {symbol}...')
-        entry_price = await fetch_mock_price(symbol)
+        entry_price = await fetch_binance_price(symbol)
         active_positions[uid] = {'symbol': symbol, 'entry': entry_price, 'side': 'LONG'}
         cursor.execute('INSERT INTO trades (timestamp, user_id, symbol, side, entry) VALUES (?, ?, ?, ?, ?)',
                        (time.time(), uid, symbol, 'LONG', entry_price))
@@ -63,17 +67,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Закрыть сделку", callback_data='close')]
         ])
         await context.bot.send_message(chat_id=uid,
-            text=f'📈 Вход в позицию {symbol} по {entry_price}\n🎯 Take Profit: {round(entry_price * 1.01, 4)}\n🛑 Stop Loss: {round(entry_price * 0.99, 4)}',
+            text=f'📈 Вход в позицию {symbol} (LONG) по {entry_price}\n🎯 Take Profit: {round(entry_price * 1.01, 4)}\n🛑 Stop Loss: {round(entry_price * 0.99, 4)}',
             reply_markup=kb)
         await update.callback_query.answer()
 
     elif data == 'enter':
-        scheduler.add_job(lambda: asyncio.create_task(monitor_price(context, uid)), 'interval', seconds=30, id=f'monitor_{uid}', replace_existing=True)
+        scheduler.add_job(monitor_price, 'interval', seconds=30, id=f'monitor_{uid}', replace_existing=True, args=[context, uid])
         await context.bot.send_message(uid, '🟢 Сделка активирована. Слежу за движением.')
         await update.callback_query.answer()
 
     elif data == 'close':
-        scheduler.remove_job(f'monitor_{uid}')
+        try:
+            scheduler.remove_job(f'monitor_{uid}')
+        except:
+            pass
         cursor.execute('UPDATE trades SET active=0 WHERE user_id=?', (uid,))
         conn.commit()
         active_positions.pop(uid, None)
@@ -91,9 +98,9 @@ async def monitor_price(context, uid):
     pos = active_positions[uid]
     symbol = pos['symbol']
     entry = pos['entry']
-    now_price = await fetch_mock_price(symbol)
+    now_price = await fetch_binance_price(symbol)
     delta = now_price - entry
-    status = f"📊 {symbol} {pos['side']}\nВход: {entry} | Сейчас: {now_price}\n"
+    status = f"📊 {symbol} ({pos['side']})\nВход: {entry} | Сейчас: {now_price}\n"
 
     if abs(delta) < 0.002:
         status += "⏳ Движение слабое. Наблюдаем."
@@ -106,9 +113,13 @@ async def monitor_price(context, uid):
 
     await context.bot.send_message(uid, status)
 
-async def fetch_mock_price(symbol):
-    import random
-    return round(3.25 + random.uniform(-0.03, 0.03), 4)
+async def fetch_binance_price(symbol):
+    try:
+        price = binance.fetch_ticker(symbol)['last']
+        return round(price, 4)
+    except Exception as e:
+        print(f"Ошибка получения цены Binance: {e}")
+        return 0.0
 
 def generate_report(uid):
     cursor.execute('SELECT timestamp, profit FROM trades WHERE user_id=? AND profit != 0', (uid,))
@@ -117,7 +128,6 @@ def generate_report(uid):
         return '⛔️ Нет данных по сделкам.'
 
     from collections import defaultdict
-    import calendar
     day_map = defaultdict(list)
     for t, p in rows:
         d = datetime.fromtimestamp(t).day
@@ -136,14 +146,14 @@ def generate_report(uid):
 async def profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     msg = update.message.text.strip()
-    try:
-        if msg.startswith('+') or msg.startswith('-') or msg.isdigit():
+    if msg.startswith('+') or msg.startswith('-'):
+        try:
             profit = float(msg)
             cursor.execute('UPDATE trades SET profit=? WHERE user_id=? AND active=0 ORDER BY timestamp DESC LIMIT 1', (profit, uid))
             conn.commit()
             await update.message.reply_text(f'💾 Записано: {profit:+.2f} USD')
-    except:
-        await update.message.reply_text('❌ Ошибка при вводе прибыли/убытка.')
+        except:
+            await update.message.reply_text('❌ Ошибка при вводе прибыли/убытка.')
 
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_ID:
