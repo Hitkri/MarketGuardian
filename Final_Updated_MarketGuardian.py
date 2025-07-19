@@ -5,23 +5,18 @@ import uuid
 import sqlite3
 import asyncio
 import requests
-import matplotlib.pyplot as plt
-import io
-
 import pandas as pd
 import numpy as np
-import openai
-from ccxt.async_support import binance as ccxt_binance
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
+from datetime import datetime, date
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+import matplotlib.pyplot as plt
+from io import BytesIO
 
 # === API KEYS ===
-TELEGRAM_BOT_TOKEN = os.getenv('7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0', '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0')
-ADMIN_ID = int(os.getenv('ADMIN_ID', '1407143951'))
-BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', 'your_binance_api_key')
-BINANCE_SECRET = os.getenv('BINANCE_SECRET', 'your_binance_secret')
-openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_key')
+TELEGRAM_BOT_TOKEN = 'your_real_token_here'  # жёстко зашит токен
+ADMIN_ID = 1407143951
 
 # === LOGGING ===
 logging.basicConfig(level=logging.INFO)
@@ -31,102 +26,147 @@ logger = logging.getLogger('trading_assistant')
 conn = sqlite3.connect('trading_bot.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, user_id INTEGER UNIQUE, username TEXT, activation_time REAL)')
-cursor.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, user_id INTEGER, mode TEXT, symbol TEXT, side TEXT, price REAL, size REAL, paper INTEGER, pnl REAL, take REAL, stop REAL)')
+cursor.execute('''
+CREATE TABLE IF NOT EXISTS trades (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp REAL,
+    user_id INTEGER,
+    symbol TEXT,
+    side TEXT,
+    entry REAL,
+    active INTEGER DEFAULT 1,
+    closed INTEGER DEFAULT 0,
+    pnl REAL DEFAULT 0
+)
+''')
 conn.commit()
 
-# === EXCHANGE INIT ===
-exchange = ccxt_binance({ 'enableRateLimit': True, 'options': {'defaultType': 'future'} })
+# === STATE ===
+active_positions = {}
+waiting_for_pnl = {}
 
-# === TELEGRAM BOT CORE ===
+# === TELEGRAM ===
 scheduler = AsyncIOScheduler()
 scheduler.start()
 
-popular_pairs = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'TON/USDT', 'DOGE/USDT', 'LINK/USDT', 'ADA/USDT', 'OP/USDT']
-
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text('Бот активен. Напиши /menu')
+
+async def menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    pairs = ['TONUSDT', 'BTCUSDT', 'ETHUSDT', 'XRPUSDT', 'BNBUSDT', 'SOLUSDT']
+    buttons = [[InlineKeyboardButton(p, callback_data=f'select_{p}')] for p in pairs]
+    buttons.append([InlineKeyboardButton('📅 Отчёт по сделкам', callback_data='report')])
+    markup = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text('Выбери пару для отслеживания:', reply_markup=markup)
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    data = update.callback_query.data
     uid = update.effective_chat.id
-    if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
-        await update.message.reply_text('🟢 Готов! Напиши /new чтобы открыть сигнал по паре.')
+
+    if data.startswith('select_'):
+        symbol = data.replace('select_', '')
+        await context.bot.send_message(uid, f'🔍 Анализирую {symbol}...')
+        entry_price = await fetch_mock_price(symbol)
+        img = generate_fake_chart(symbol, entry_price)
+        active_positions[uid] = {'symbol': symbol, 'entry': entry_price, 'side': 'LONG'}
+        cursor.execute('INSERT INTO trades (timestamp, user_id, symbol, side, entry) VALUES (?, ?, ?, ?, ?)',
+                       (time.time(), uid, symbol, 'LONG', entry_price))
+        conn.commit()
+
+        kb = InlineKeyboardMarkup([[InlineKeyboardButton("❌ Закрыть сделку", callback_data='close')]])
+        await context.bot.send_photo(chat_id=uid, photo=img,
+            caption=f'📈 Вход в позицию {symbol} по {entry_price}\nСледим за движением...\nДержим!', reply_markup=kb)
+        scheduler.add_job(lambda: asyncio.create_task(monitor_price(context, uid)), 'interval', seconds=30, id=f'monitor_{uid}', replace_existing=True)
+        await update.callback_query.answer()
+
+    elif data == 'close':
+        scheduler.remove_job(f'monitor_{uid}')
+        cursor.execute('UPDATE trades SET active=0 WHERE user_id=? AND active=1 ORDER BY timestamp DESC LIMIT 1', (uid,))
+        conn.commit()
+        await context.bot.send_message(uid, '💼 Сделка закрыта. Напиши, сколько заработал или потерял (например: +10 или -5)')
+        waiting_for_pnl[uid] = True
+        active_positions.pop(uid, None)
+        await update.callback_query.answer()
+
+    elif data == 'report':
+        await generate_report(uid, context)
+        await update.callback_query.answer()
+
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if uid in waiting_for_pnl:
+        try:
+            value = float(update.message.text.replace('+',''))
+            cursor.execute('''UPDATE trades SET closed=1, pnl=? WHERE user_id=? AND closed=0 ORDER BY timestamp DESC LIMIT 1''',
+                           (value, uid))
+            conn.commit()
+            await update.message.reply_text(f'✅ Записано: {value} USD')
+        except:
+            await update.message.reply_text('Ошибка ввода. Напиши пример: +10 или -5')
+        waiting_for_pnl.pop(uid, None)
+
+async def monitor_price(context, uid):
+    if uid not in active_positions:
+        return
+    pos = active_positions[uid]
+    symbol = pos['symbol']
+    entry = pos['entry']
+    side = pos['side']
+    now_price = await fetch_mock_price(symbol)
+    delta = now_price - entry
+    status = f"📊 {symbol} {side}\nВход: {entry} | Сейчас: {now_price}\n"
+
+    if abs(delta) < 0.002:
+        status += "⏳ Движение слабое. Наблюдаем."
+    elif delta > 0.01:
+        status += "✅ Отличный рост. Держим!"
+    elif delta < -0.01:
+        status += "⚠️ Цена падает. Возможен выход."
     else:
-        await update.message.reply_text('❌ Не активирован. Введите: /activate <token>')
+        status += "📈 Позиция активна. Всё стабильно."
 
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if len(context.args) != 1:
-        return await update.message.reply_text('Формат: /activate <token>')
-    token = context.args[0]
-    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
-        return await update.message.reply_text('❌ Токен недействителен')
-    cursor.execute('UPDATE tokens SET user_id=?, username=?, activation_time=? WHERE token=?',
-                   (uid, update.effective_user.username, time.time(), token))
-    conn.commit()
-    await update.message.reply_text('✅ Активировано. Теперь напиши /new')
+    await context.bot.send_message(uid, status)
 
-async def new_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = []
-    for pair in popular_pairs:
-        keyboard.append([InlineKeyboardButton(pair, callback_data=f'signal_{pair.replace("/", "")}')])
-    markup = InlineKeyboardMarkup(keyboard)
-    await update.message.reply_text('Выбери пару для сигнала:', reply_markup=markup)
+async def fetch_mock_price(symbol):
+    import random
+    return round(3.25 + random.uniform(-0.015, 0.015), 4)
 
-async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    sym_raw = query.data.split('_')[1]
-    symbol = sym_raw.replace('USDT', '') + '/USDT'
-    ohlcv = await exchange.fetch_ohlcv(symbol, '5m', limit=50)
-    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    price = df['close'].iloc[-1]
-    last_high = df['high'].max()
-    last_low = df['low'].min()
-    midpoint = round((last_high + last_low) / 2, 4)
-    side = 'SHORT' if price > midpoint else 'LONG'
-    stop = round(price * (1.01 if side == 'SHORT' else 0.99), 4)
-    take = round(price * (0.99 if side == 'SHORT' else 1.01), 4)
-
-    # Chart
-    fig, ax = plt.subplots()
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-    ax.plot(df['timestamp'], df['close'], label='Price')
-    ax.axhline(price, color='blue', linestyle='--', label='Entry')
-    ax.axhline(stop, color='red', linestyle='--', label='Stop')
-    ax.axhline(take, color='green', linestyle='--', label='Take')
-    ax.legend()
-    ax.set_title(symbol)
-    buf = io.BytesIO()
+def generate_fake_chart(symbol, price):
+    x = pd.date_range(end=datetime.now(), periods=30, freq='T')
+    y = [price + np.sin(i / 5) * 0.01 for i in range(30)]
+    plt.figure(figsize=(6,3))
+    plt.plot(x, y, label=symbol)
+    plt.axhline(price, color='green', linestyle='--', label=f'Entry {price}')
+    plt.title(f'{symbol} Entry = {price}')
+    plt.legend()
+    plt.xticks(rotation=45)
+    plt.tight_layout()
+    buf = BytesIO()
     plt.savefig(buf, format='png')
     buf.seek(0)
+    plt.close()
+    return buf
 
-    text = f"📊 {symbol}\nРежим: {side}\nТекущая: {price}\nВход: {price}\nСтоп: {stop}\nТейк: {take}\n\nНажми ВХОД после входа в сделку."
-    buttons = [[InlineKeyboardButton("📥 ВХОД", callback_data=f'enter_{symbol}_{side}_{price}_{stop}_{take}')]]
-    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
-    await context.bot.send_photo(query.message.chat.id, photo=InputFile(buf, filename="chart.png"))
-
-async def handle_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    parts = query.data.split('_')
-    uid = update.effective_chat.id
-    symbol = parts[1] + '/' + parts[2]
-    side = parts[3]
-    entry = float(parts[4])
-    stop = float(parts[5])
-    take = float(parts[6])
-    cursor.execute('INSERT INTO trades(timestamp, user_id, mode, symbol, side, price, size, paper, pnl, take, stop) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
-                   (time.time(), uid, 'futures', symbol, side, entry, 0, 1, 0, take, stop))
-    conn.commit()
-    await query.edit_message_text(f"📥 Позиция по {symbol} открыта по цене {entry}\nСледим... (ручной режим)")
-
-async def pnl_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    rows = cursor.execute('SELECT side, price, pnl FROM trades WHERE user_id=?', (uid,)).fetchall()
+async def generate_report(uid, context):
+    cursor.execute('SELECT timestamp, pnl FROM trades WHERE user_id=? AND closed=1', (uid,))
+    rows = cursor.fetchall()
     if not rows:
-        await update.message.reply_text("Нет сделок")
-        return
-    total = sum(r[2] for r in rows)
-    count = len(rows)
-    avg = total / count
-    await update.message.reply_text(f"📈 Сделок: {count}\n💰 Общий PNL: {round(total, 2)} USDT\n📊 Средний: {round(avg, 2)} USDT")
+        return await context.bot.send_message(uid, 'Нет завершённых сделок.')
+
+    daily = {}
+    for ts, pnl in rows:
+        d = date.fromtimestamp(ts).day
+        daily[d] = daily.get(d, 0) + pnl
+
+    report_lines = ['📅 Отчёт по дням:']
+    for day in range(1, 32):
+        val = daily.get(day)
+        if val is not None:
+            report_lines.append(f'{day:02d}: {val:+.2f} USD')
+
+    total = sum(daily.values())
+    report_lines.append(f'\n📈 За месяц: {total:+.2f} USD')
+    await context.bot.send_message(uid, '\n'.join(report_lines))
 
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_ID:
@@ -139,12 +179,10 @@ async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('activate', activate))
-    app.add_handler(CommandHandler('new', new_signal))
-    app.add_handler(CommandHandler('stats', pnl_stats))
+    app.add_handler(CommandHandler('menu', menu))
     app.add_handler(CommandHandler('generate_token', generate_token))
-    app.add_handler(CallbackQueryHandler(handle_signal, pattern=r'^signal_'))
-    app.add_handler(CallbackQueryHandler(handle_entry, pattern=r'^enter_'))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     app.run_polling()
 
 if __name__ == '__main__':
