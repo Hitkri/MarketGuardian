@@ -74,14 +74,18 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
     elif data == 'enter':
-        asyncio.get_running_loop().create_task(monitor_price(context, uid))
+        scheduler.add_job(monitor_price_job, 'interval', seconds=30, id=f'monitor_{uid}', replace_existing=True, args=[context, uid])
         await context.bot.send_message(uid, '🟢 Сделка активирована. Слежу за движением.')
         await update.callback_query.answer()
 
     elif data == 'close':
-        active_positions.pop(uid, None)
-        cursor.execute('UPDATE trades SET active=0 WHERE user_id=? AND active=1 ORDER BY timestamp DESC LIMIT 1', (uid,))
+        try:
+            scheduler.remove_job(f'monitor_{uid}')
+        except:
+            pass
+        cursor.execute('UPDATE trades SET active=0 WHERE user_id=? AND active=1', (uid,))
         conn.commit()
+        active_positions.pop(uid, None)
         await context.bot.send_message(uid, '💼 Сделка закрыта. Напиши +10 или -5 — сколько заработал/потерял?')
         await update.callback_query.answer()
 
@@ -89,6 +93,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         report = generate_report(uid)
         await context.bot.send_message(uid, report)
         await update.callback_query.answer()
+
+def monitor_price_job(context, uid):
+    asyncio.create_task(monitor_price(context, uid))
 
 async def monitor_price(context, uid):
     if uid not in active_positions:
@@ -201,9 +208,14 @@ async def profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if msg.startswith('+') or msg.startswith('-') or msg.startswith('0'):
         try:
             profit = float(msg)
-            cursor.execute('UPDATE trades SET profit=? WHERE user_id=? AND active=0 ORDER BY timestamp DESC LIMIT 1', (profit, uid))
-            conn.commit()
-            await update.message.reply_text(f'💾 Записано: {profit:+.2f} USD')
+            cursor.execute('SELECT id FROM trades WHERE user_id=? AND active=0 ORDER BY timestamp DESC LIMIT 1', (uid,))
+            row = cursor.fetchone()
+            if row:
+                cursor.execute('UPDATE trades SET profit=? WHERE id=?', (profit, row[0]))
+                conn.commit()
+                await update.message.reply_text(f'💾 Записано: {profit:+.2f} USD')
+            else:
+                await update.message.reply_text('❌ Не найдена закрытая сделка.')
         except Exception as e:
             logger.error(f"Ошибка записи прибыли: {e}")
             await update.message.reply_text('❌ Ошибка при вводе прибыли/убытка.')
