@@ -17,7 +17,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandle
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # === API KEYS ===
-TELEGRAM_BOT_TOKEN = os.getenv('7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0', 'your_telegram_token')
+TELEGRAM_BOT_TOKEN = os.getenv('7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0', '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '1407143951'))
 BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', 'your_binance_api_key')
 BINANCE_SECRET = os.getenv('BINANCE_SECRET', 'your_binance_secret')
