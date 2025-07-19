@@ -63,7 +63,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Закрыть сделку", callback_data='close')]
         ])
         await context.bot.send_message(chat_id=uid,
-            text=f"📈 Вход в позицию {symbol} по {entry_price}\n🎯 Take Profit: {round(entry_price * 1.01, 4)}\n🛑 Stop Loss: {round(entry_price * 0.99, 4)}",
+            text=f'📈 Вход в позицию {symbol} по {entry_price}\n🎯 Take Profit: {round(entry_price * 1.01, 4)}\n🛑 Stop Loss: {round(entry_price * 0.99, 4)}',
             reply_markup=kb)
         await update.callback_query.answer()
 
@@ -136,14 +136,14 @@ def generate_report(uid):
 async def profit_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     msg = update.message.text.strip()
-    if uid not in active_positions and (msg.startswith('+') or msg.startswith('-')):
-        try:
+    try:
+        if msg.startswith('+') or msg.startswith('-') or msg.isdigit():
             profit = float(msg)
             cursor.execute('UPDATE trades SET profit=? WHERE user_id=? AND active=0 ORDER BY timestamp DESC LIMIT 1', (profit, uid))
             conn.commit()
             await update.message.reply_text(f'💾 Записано: {profit:+.2f} USD')
-        except:
-            await update.message.reply_text('❌ Ошибка при вводе прибыли/убытка.')
+    except:
+        await update.message.reply_text('❌ Ошибка при вводе прибыли/убытка.')
 
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_ID:
