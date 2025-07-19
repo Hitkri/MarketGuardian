@@ -63,9 +63,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("❌ Закрыть сделку", callback_data='close')]
         ])
         await context.bot.send_message(chat_id=uid,
-            text=f'📈 Вход в позицию {symbol} по {entry_price}
-🎯 Take Profit: {round(entry_price * 1.01, 4)}
-🛑 Stop Loss: {round(entry_price * 0.99, 4)}',
+            text=f"📈 Вход в позицию {symbol} по {entry_price}\n🎯 Take Profit: {round(entry_price * 1.01, 4)}\n🛑 Stop Loss: {round(entry_price * 0.99, 4)}",
             reply_markup=kb)
         await update.callback_query.answer()
 
@@ -95,9 +93,7 @@ async def monitor_price(context, uid):
     entry = pos['entry']
     now_price = await fetch_mock_price(symbol)
     delta = now_price - entry
-    status = f"📊 {symbol} {pos['side']}
-Вход: {entry} | Сейчас: {now_price}
-"
+    status = f"📊 {symbol} {pos['side']}\nВход: {entry} | Сейчас: {now_price}\n"
 
     if abs(delta) < 0.002:
         status += "⏳ Движение слабое. Наблюдаем."
@@ -127,15 +123,13 @@ def generate_report(uid):
         d = datetime.fromtimestamp(t).day
         day_map[d].append(p)
 
-    text = '📅 Отчёт по сделкам:
-'
+    text = '📅 Отчёт по сделкам:\n'
     monthly_total = 0
     for day in sorted(day_map):
         total = sum(day_map[day])
         monthly_total += total
         count = len(day_map[day])
-        text += f'• {day} число: {total:+.2f} USD ({count} сделок)
-'
+        text += f'• {day} число: {total:+.2f} USD ({count} сделок)\n'
     text += f'📈 Всего за месяц: {monthly_total:+.2f} USD'
     return text
 
