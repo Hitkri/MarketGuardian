@@ -15,7 +15,7 @@ import matplotlib.pyplot as plt
 from io import BytesIO
 
 # === API KEYS ===
-TELEGRAM_BOT_TOKEN = 'your_real_token_here'  # жёстко зашит токен
+TELEGRAM_BOT_TOKEN = '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0'  # жёстко зашит токен
 ADMIN_ID = 1407143951
 
 # === LOGGING ===
