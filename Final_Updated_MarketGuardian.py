@@ -74,15 +74,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
     elif data == 'enter':
-        scheduler.add_job(lambda: asyncio.create_task(monitor_price(context, uid)), 'interval', seconds=30, id=f'monitor_{uid}', replace_existing=True)
+        asyncio.get_running_loop().create_task(monitor_price(context, uid))
         await context.bot.send_message(uid, '🟢 Сделка активирована. Слежу за движением.')
         await update.callback_query.answer()
 
     elif data == 'close':
-        scheduler.remove_job(f'monitor_{uid}')
-        cursor.execute('UPDATE trades SET active=0 WHERE user_id=?', (uid,))
-        conn.commit()
         active_positions.pop(uid, None)
+        cursor.execute('UPDATE trades SET active=0 WHERE user_id=? AND active=1 ORDER BY timestamp DESC LIMIT 1', (uid,))
+        conn.commit()
         await context.bot.send_message(uid, '💼 Сделка закрыта. Напиши +10 или -5 — сколько заработал/потерял?')
         await update.callback_query.answer()
 
@@ -92,42 +91,33 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
 async def monitor_price(context, uid):
-    try:
-        await context.bot.send_message(uid, "🛠 monitor_price запущен.")
-        if uid not in active_positions:
-            await context.bot.send_message(uid, "⚠️ Позиция не найдена.")
-            return
+    if uid not in active_positions:
+        return
+    pos = active_positions[uid]
+    symbol = pos['symbol']
+    entry = pos['entry']
+    now_price = await fetch_price(symbol)
+    delta = now_price - entry
+    danger_zone = round(entry * 0.985, 4)
+    tp = round(entry * 1.01, 4)
+    sl = round(entry * 0.99, 4)
 
-        pos = active_positions[uid]
-        symbol = pos['symbol']
-        entry = pos['entry']
-        now_price = await fetch_price(symbol)
-        delta = now_price - entry
-        danger_zone = round(entry * 0.985, 4)
-        tp = round(entry * 1.01, 4)
-        sl = round(entry * 0.99, 4)
+    rsi, macd_signal = await fetch_indicators(symbol)
 
-        rsi, macd_signal = await fetch_indicators(symbol)
+    status = f"📊 {symbol} ({pos['side']})\nВход: {entry} | Сейчас: {now_price}\n"
+    if now_price <= sl:
+        status += "❗ Цена достигла Stop Loss. Рекомендуется закрыть позицию."
+    elif now_price >= tp:
+        status += "✅ Достигнут Take Profit. Зафиксируйте прибыль."
+    elif now_price < danger_zone:
+        status += f"⚠️ Цена опустилась ниже {danger_zone}. Возможен пробой вниз — подумайте о выходе."
+    elif abs(delta) < 0.002:
+        status += "⏳ Рынок в боковике. Можно ждать подтверждения."
+    else:
+        status += f"🔄 Цена в пределах нормы.\nЕсли цена пробьёт {tp}, возможен рост. Если упадёт ниже {sl}, возможен разворот вниз."
 
-        status = f"📊 {symbol} ({pos['side']})\nВход: {entry} | Сейчас: {now_price}\n"
-        if now_price <= sl:
-            status += "❗ Цена достигла Stop Loss. Рекомендуется закрыть позицию."
-        elif now_price >= tp:
-            status += "✅ Достигнут Take Profit. Зафиксируйте прибыль."
-        elif now_price < danger_zone:
-            status += f"⚠️ Цена опустилась ниже {danger_zone}. Возможен пробой вниз — подумайте о выходе."
-        elif abs(delta) < 0.002:
-            status += "⏳ Рынок в боковике. Можно ждать подтверждения."
-        else:
-            status += f"🔄 Цена в пределах нормы.\nЕсли цена пробьёт {tp}, возможен рост. Если упадёт ниже {sl}, возможен разворот вниз."
-
-        status += f"\n📈 RSI: {rsi:.2f} | MACD сигнал: {'↑' if macd_signal else '↓'}"
-
-        await context.bot.send_message(uid, "📬 Обновление цен отправлено")
-        await context.bot.send_message(uid, status)
-
-    except Exception as e:
-        await context.bot.send_message(uid, f"❌ Ошибка в monitor_price: {e}")
+    status += f"\n📈 RSI: {rsi:.2f} | MACD сигнал: {'↑' if macd_signal else '↓'}"
+    await context.bot.send_message(uid, status)
 
 async def fetch_price(symbol):
     try:
