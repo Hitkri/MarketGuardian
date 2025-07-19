@@ -152,7 +152,7 @@ def compute_rsi(series, period):
 async def generate_chart(symbol, entry_price):
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, '5m')[-30:]
-        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', ' 'Low', 'Close', 'Volume'])
+        df = pd.DataFrame(ohlcv, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
         df['Date'] = pd.to_datetime(df['Timestamp'], unit='ms')
         df.set_index('Date', inplace=True)
 
