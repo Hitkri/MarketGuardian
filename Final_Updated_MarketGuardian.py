@@ -92,33 +92,42 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.answer()
 
 async def monitor_price(context, uid):
-    if uid not in active_positions:
-        return
-    pos = active_positions[uid]
-    symbol = pos['symbol']
-    entry = pos['entry']
-    now_price = await fetch_price(symbol)
-    delta = now_price - entry
-    danger_zone = round(entry * 0.985, 4)
-    tp = round(entry * 1.01, 4)
-    sl = round(entry * 0.99, 4)
+    try:
+        await context.bot.send_message(uid, "🛠 monitor_price запущен.")
+        if uid not in active_positions:
+            await context.bot.send_message(uid, "⚠️ Позиция не найдена.")
+            return
 
-    rsi, macd_signal = await fetch_indicators(symbol)
+        pos = active_positions[uid]
+        symbol = pos['symbol']
+        entry = pos['entry']
+        now_price = await fetch_price(symbol)
+        delta = now_price - entry
+        danger_zone = round(entry * 0.985, 4)
+        tp = round(entry * 1.01, 4)
+        sl = round(entry * 0.99, 4)
 
-    status = f"📊 {symbol} ({pos['side']})\nВход: {entry} | Сейчас: {now_price}\n"
-    if now_price <= sl:
-        status += "❗ Цена достигла Stop Loss. Рекомендуется закрыть позицию."
-    elif now_price >= tp:
-        status += "✅ Достигнут Take Profit. Зафиксируйте прибыль."
-    elif now_price < danger_zone:
-        status += f"⚠️ Цена опустилась ниже {danger_zone}. Возможен пробой вниз — подумайте о выходе."
-    elif abs(delta) < 0.002:
-        status += "⏳ Рынок в боковике. Можно ждать подтверждения."
-    else:
-        status += f"🔄 Цена в пределах нормы.\nЕсли цена пробьёт {tp}, возможен рост. Если упадёт ниже {sl}, возможен разворот вниз."
+        rsi, macd_signal = await fetch_indicators(symbol)
 
-    status += f"\n📈 RSI: {rsi:.2f} | MACD сигнал: {'↑' if macd_signal else '↓'}"
-    await context.bot.send_message(uid, status)
+        status = f"📊 {symbol} ({pos['side']})\nВход: {entry} | Сейчас: {now_price}\n"
+        if now_price <= sl:
+            status += "❗ Цена достигла Stop Loss. Рекомендуется закрыть позицию."
+        elif now_price >= tp:
+            status += "✅ Достигнут Take Profit. Зафиксируйте прибыль."
+        elif now_price < danger_zone:
+            status += f"⚠️ Цена опустилась ниже {danger_zone}. Возможен пробой вниз — подумайте о выходе."
+        elif abs(delta) < 0.002:
+            status += "⏳ Рынок в боковике. Можно ждать подтверждения."
+        else:
+            status += f"🔄 Цена в пределах нормы.\nЕсли цена пробьёт {tp}, возможен рост. Если упадёт ниже {sl}, возможен разворот вниз."
+
+        status += f"\n📈 RSI: {rsi:.2f} | MACD сигнал: {'↑' if macd_signal else '↓'}"
+
+        await context.bot.send_message(uid, "📬 Обновление цен отправлено")
+        await context.bot.send_message(uid, status)
+
+    except Exception as e:
+        await context.bot.send_message(uid, f"❌ Ошибка в monitor_price: {e}")
 
 async def fetch_price(symbol):
     try:
