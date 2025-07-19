@@ -5,224 +5,128 @@ import uuid
 import sqlite3
 import asyncio
 import requests
+import matplotlib.pyplot as plt
+import io
 
 import pandas as pd
 import numpy as np
 import openai
 from ccxt.async_support import binance as ccxt_binance
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, InputFile
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
-# from sklearn.preprocessing import MinMaxScaler  # Removed dependency
 
-# Dash dashboard removed - not installed
-
-# === PHASE 6: BOT WITH CCXT POLLING & DASHBOARD ===
-
-# === API KEYS & TOKENS ===
-TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', '7635928627:AAFiDfGdfZKoReNnGDXkjaDm4Q3qm4AH0t0')
+# === API KEYS ===
+TELEGRAM_BOT_TOKEN = os.getenv('TELEGRAM_BOT_TOKEN', 'your_telegram_token')
 ADMIN_ID = int(os.getenv('ADMIN_ID', '1407143951'))
 BINANCE_API_KEY = os.getenv('BINANCE_API_KEY', 'your_binance_api_key')
 BINANCE_SECRET = os.getenv('BINANCE_SECRET', 'your_binance_secret')
-OPENAI_API_KEY = os.getenv('OPENAI_API_KEY', 'sk-...')
-COVALENT_API_KEY = os.getenv('COVALENT_API_KEY', 'cqt_rQYF3wXMKqTkJGdWPBRy3B8vwrrh')
-
-openai.api_key = OPENAI_API_KEY
-
-# === CONFIGURATION ===
-BUDGET_FUTURES = 500
-BUDGET_SPOT = 3000
-# Top 20 spot pairs on Binance:
-SPOT_PAIRS = [
-    'BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT',
-    'ADA/USDT', 'DOGE/USDT', 'MATIC/USDT', 'DOT/USDT', 'LTC/USDT',
-    'LINK/USDT', 'BCH/USDT', 'AVAX/USDT', 'UNI/USDT', 'SHIB/USDT',
-    'TRX/USDT', 'ETC/USDT', 'FIL/USDT', 'NEAR/USDT', 'AXS/USDT'
-]
-# Use the same top 20 list for futures
-FUTURES_PAIRS = SPOT_PAIRS.copy()
-TIMEFRAMES = ['5m', '15m', '1h']
-QUALITY_THRESHOLD = 5.0
-RSI_LOW_Q, RSI_HIGH_Q = 10, 90
-ATR_LOW_Q, ATR_HIGH_Q = 10, 90
-SENTIMENT_THRESHOLD = 0.0  # disabled sentiment
+openai.api_key = os.getenv('OPENAI_API_KEY', 'your_openai_key')
 
 # === LOGGING ===
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger('trading_bot')
+logger = logging.getLogger('trading_assistant')
 
-# === DATABASE SETUP ===
+# === DATABASE ===
 conn = sqlite3.connect('trading_bot.db', check_same_thread=False)
 cursor = conn.cursor()
 cursor.execute('CREATE TABLE IF NOT EXISTS tokens (token TEXT PRIMARY KEY, user_id INTEGER UNIQUE, username TEXT, activation_time REAL)')
-cursor.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, user_id INTEGER, mode TEXT, symbol TEXT, side TEXT, price REAL, size REAL, paper INTEGER)')
-cursor.execute('CREATE TABLE IF NOT EXISTS last_signals (mode TEXT, symbol TEXT PRIMARY KEY, direction TEXT, timestamp REAL)')
+cursor.execute('CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL, user_id INTEGER, mode TEXT, symbol TEXT, side TEXT, price REAL, size REAL, paper INTEGER, pnl REAL, take REAL, stop REAL)')
 conn.commit()
 
 # === EXCHANGE INIT ===
-# Use public endpoints only (no API key required for fetching OHLCV)
-exchange = ccxt_binance({'enableRateLimit': True})
+exchange = ccxt_binance({ 'enableRateLimit': True, 'options': {'defaultType': 'future'} })
 
-# === INDICATORS ===
-def compute_rsi(df, period=14):
-    delta = df['close'].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.ewm(alpha=1/period, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/period, adjust=False).mean()
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
+# === TELEGRAM BOT CORE ===
+scheduler = AsyncIOScheduler()
+scheduler.start()
 
-
-def compute_atr(df, period=14):
-    hl = df['high'] - df['low']
-    hc = (df['high'] - df['close'].shift()).abs()
-    lc = (df['low'] - df['close'].shift()).abs()
-    tr = pd.concat([hl, hc, lc], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-
-def compute_macd(df):
-    ema12 = df['close'].ewm(span=12, adjust=False).mean()
-    ema26 = df['close'].ewm(span=26, adjust=False).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9, adjust=False).mean()
-    hist = macd - signal
-    return macd, signal, hist
-
-
-def compute_bbands(df):
-    mb = df['close'].rolling(20).mean()
-    sd = df['close'].rolling(20).std()
-    ub = mb + 2 * sd
-    lb = mb - 2 * sd
-    return mb, ub, lb
-
-
-def compute_stoch(df):
-    low = df['low'].rolling(14).min()
-    high = df['high'].rolling(14).max()
-    k = 100 * (df['close'] - low) / (high - low)
-    d = k.rolling(3).mean()
-    return k, d
-
-
-def compute_vwap(df):
-    tp = (df['high'] + df['low'] + df['close']) / 3
-    return (tp * df['volume']).cumsum() / df['volume'].cumsum()
-
-# === FORECASTING ===
-def forecast_next(df):
-    y = df['close'].values
-    x = np.arange(len(y))
-    if len(x) < 2:
-        return y[-1] if len(y) else 0
-    coeffs = np.polyfit(x, y, 1)
-    return coeffs[0] * len(x) + coeffs[1]
-
-# === FUNDAMENTALS VIA COVALENT ===
-def fetch_onchain(symbol):
-    asset = symbol.split('/')[0]
-    url = f"https://api.covalenthq.com/v1/pricing/historical_v2/{asset}/USD/" \
-          f"?quote-currency=USD&format=JSON&key={COVALENT_API_KEY}"
-    r = requests.get(url)
-    if r.ok:
-        prices = r.json().get('data', {}).get('prices', [])
-        return prices[-1].get('volume_24h_quote', 0) if prices else None
-    return None
-
-# === SIGNAL GENERATION ===
-async def generate_signal(symbol, mode='spot'):
-    # fetch candles
-    frames = {}
-    for tf in TIMEFRAMES:
-        ohlcv = await exchange.fetch_ohlcv(symbol, tf, limit=50)
-        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
-        df.set_index('timestamp', inplace=True)
-        frames[tf] = df
-    # technical
-    latest = frames[TIMEFRAMES[-1]]
-    price = latest['close'].iloc[-1]
-    # example simple trend
-    entry = forecast_next(latest)
-    atr = compute_atr(latest).iloc[-1]
-    stop = entry - atr * 1.5
-    take = entry + atr * 3
-    direction = 'LONG' if take > entry else 'SHORT'
-    quality = abs(entry - price)
-    return {
-        'symbol': symbol,
-        'direction': direction,
-        'price': round(entry, 4),
-        'stop': round(stop, 4),
-        'take': round(take, 4),
-        'quality': round(quality, 4),
-        'signal': True
-    }
-
-# === STATE & RECORD ===
-def get_last_signal(mode, symbol):
-    row = cursor.execute('SELECT direction FROM last_signals WHERE mode=? AND symbol=?', (mode, symbol)).fetchone()
-    return row[0] if row else None
-
-def update_last_signal(mode, symbol, direction):
-    cursor.execute('INSERT OR REPLACE INTO last_signals(mode, symbol, direction, timestamp) VALUES(?,?,?,?)',
-                   (mode, symbol, direction, time.time()))
-    conn.commit()
-
-def record_trade(user_id, mode, symbol, side, price, size, paper=True):
-    cursor.execute('INSERT INTO trades(timestamp,user_id,mode,symbol,side,price,size,paper) VALUES(?,?,?,?,?,?,?,?)',
-                   (time.time(), user_id, mode, symbol, side, price, size, int(paper)))
-    conn.commit()
-
-# === MESSAGE FORMATTING ===
-def format_signal(sig, mode):
-    typ = 'FUTURES' if mode=='futures' else 'SPOT'
-    text = (f"⚡ {typ} {sig['symbol']}\nDir: {sig['direction']}\n"
-            f"Entry: {sig['price']}\nStop: {sig['stop']} | Take: {sig['take']}\n"
-            f"Quality: {sig['quality']}")
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("Monitor", callback_data=f"monitor_{mode}_{sig['symbol']}")]])
-    return text, kb
-
-# === MONITORING ===
-async def monitor_markets(app):
-    tasks = [process_symbol(app, s, m) for m,pairs in [('spot', SPOT_PAIRS),('futures',FUTURES_PAIRS)] for s in pairs]
-    await asyncio.gather(*tasks)
-
-async def process_symbol(app, sym, mode):
-    sig = await generate_signal(sym, mode)
-    last = get_last_signal(mode, sym)
-    if sig and sig['signal'] and sig['direction']!=last:
-        update_last_signal(mode, sym, sig['direction'])
-        msg,kb = format_signal(sig, mode)
-        users = cursor.execute('SELECT user_id FROM tokens').fetchall()
-        for (uid,) in users:
-            await app.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
-            record_trade(uid, mode, sym, sig['direction'], sig['price'], 0)
-
-# === DASHBOARD REMOVED ===
-# Dashboard feature disabled
-
-# === TELEGRAM HANDLERS ===
-
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        [InlineKeyboardButton('🟢 Spot Signals', callback_data='spot')],
-        [InlineKeyboardButton('🔴 Futures Signals', callback_data='futures')],
-    ]
-    reply_markup = InlineKeyboardMarkup(keyboard)
-    if update.message:
-        await update.message.reply_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
-    else:
-        await update.callback_query.edit_message_text('<b>Select Mode:</b>', parse_mode='HTML', reply_markup=reply_markup)
+popular_pairs = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'XRP/USDT', 'SOL/USDT', 'TON/USDT', 'DOGE/USDT', 'LINK/USDT', 'ADA/USDT', 'OP/USDT']
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = update.effective_chat.id
     if cursor.execute('SELECT 1 FROM tokens WHERE user_id=?', (uid,)).fetchone():
-        await main_menu(update, context)
+        await update.message.reply_text('🟢 Готов! Напиши /new чтобы открыть сигнал по паре.')
     else:
-        await update.message.reply_text('Use /activate <token>')
+        await update.message.reply_text('❌ Не активирован. Введите: /activate <token>')
+
+async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    if len(context.args) != 1:
+        return await update.message.reply_text('Формат: /activate <token>')
+    token = context.args[0]
+    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
+        return await update.message.reply_text('❌ Токен недействителен')
+    cursor.execute('UPDATE tokens SET user_id=?, username=?, activation_time=? WHERE token=?',
+                   (uid, update.effective_user.username, time.time(), token))
+    conn.commit()
+    await update.message.reply_text('✅ Активировано. Теперь напиши /new')
+
+async def new_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = []
+    for pair in popular_pairs:
+        keyboard.append([InlineKeyboardButton(pair, callback_data=f'signal_{pair.replace("/", "")}')])
+    markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text('Выбери пару для сигнала:', reply_markup=markup)
+
+async def handle_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    sym_raw = query.data.split('_')[1]
+    symbol = sym_raw.replace('USDT', '') + '/USDT'
+    ohlcv = await exchange.fetch_ohlcv(symbol, '5m', limit=50)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    price = df['close'].iloc[-1]
+    last_high = df['high'].max()
+    last_low = df['low'].min()
+    midpoint = round((last_high + last_low) / 2, 4)
+    side = 'SHORT' if price > midpoint else 'LONG'
+    stop = round(price * (1.01 if side == 'SHORT' else 0.99), 4)
+    take = round(price * (0.99 if side == 'SHORT' else 1.01), 4)
+
+    # Chart
+    fig, ax = plt.subplots()
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    ax.plot(df['timestamp'], df['close'], label='Price')
+    ax.axhline(price, color='blue', linestyle='--', label='Entry')
+    ax.axhline(stop, color='red', linestyle='--', label='Stop')
+    ax.axhline(take, color='green', linestyle='--', label='Take')
+    ax.legend()
+    ax.set_title(symbol)
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png')
+    buf.seek(0)
+
+    text = f"📊 {symbol}\nРежим: {side}\nТекущая: {price}\nВход: {price}\nСтоп: {stop}\nТейк: {take}\n\nНажми ВХОД после входа в сделку."
+    buttons = [[InlineKeyboardButton("📥 ВХОД", callback_data=f'enter_{symbol}_{side}_{price}_{stop}_{take}')]]
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup(buttons))
+    await context.bot.send_photo(query.message.chat.id, photo=InputFile(buf, filename="chart.png"))
+
+async def handle_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = query.data.split('_')
+    uid = update.effective_chat.id
+    symbol = parts[1] + '/' + parts[2]
+    side = parts[3]
+    entry = float(parts[4])
+    stop = float(parts[5])
+    take = float(parts[6])
+    cursor.execute('INSERT INTO trades(timestamp, user_id, mode, symbol, side, price, size, paper, pnl, take, stop) VALUES (?,?,?,?,?,?,?,?,?,?,?)',
+                   (time.time(), uid, 'futures', symbol, side, entry, 0, 1, 0, take, stop))
+    conn.commit()
+    await query.edit_message_text(f"📥 Позиция по {symbol} открыта по цене {entry}\nСледим... (ручной режим)")
+
+async def pnl_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_chat.id
+    rows = cursor.execute('SELECT side, price, pnl FROM trades WHERE user_id=?', (uid,)).fetchall()
+    if not rows:
+        await update.message.reply_text("Нет сделок")
+        return
+    total = sum(r[2] for r in rows)
+    count = len(rows)
+    avg = total / count
+    await update.message.reply_text(f"📈 Сделок: {count}\n💰 Общий PNL: {round(total, 2)} USDT\n📊 Средний: {round(avg, 2)} USDT")
 
 async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_chat.id != ADMIN_ID:
@@ -232,98 +136,15 @@ async def generate_token(update: Update, context: ContextTypes.DEFAULT_TYPE):
     conn.commit()
     await update.message.reply_text(f'Token: {token}')
 
-async def activate(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    uid = update.effective_chat.id
-    if len(context.args) != 1:
-        return await update.message.reply_text('Use /activate <token>')
-    token = context.args[0]
-    if not cursor.execute('SELECT token FROM tokens WHERE token=? AND user_id IS NULL', (token,)).fetchone():
-        return await update.message.reply_text('Invalid token')
-    cursor.execute('UPDATE tokens SET user_id=?, username=?, activation_time=? WHERE token=?',
-                   (uid, update.effective_user.username, time.time(), token))
-    conn.commit()
-    await main_menu(update, context)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    data = update.callback_query.data
-    uid = update.effective_chat.id
-    # User selects mode: show list of pairs
-    if data in ('spot', 'futures'):
-        mode = data
-        # Build keyboard of pairs
-        pairs = SPOT_PAIRS if mode=='spot' else FUTURES_PAIRS
-        keyboard = []
-        for i in range(0, len(pairs), 2):
-            row = []
-            for j in range(2):
-                if i+j < len(pairs):
-                    sym = pairs[i+j]
-                    row.append(InlineKeyboardButton(sym, callback_data=f"pair_{mode}_{sym}"))
-            keyboard.append(row)
-        keyboard.append([InlineKeyboardButton("⬅️ Back", callback_data='back')])
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        await update.callback_query.edit_message_text(
-            f"<b>Select {mode.capitalize()} Pair:</b>", parse_mode='HTML', reply_markup=reply_markup)
-        await update.callback_query.answer()
-        return
-    # Back to main menu
-    if data == 'back':
-        await main_menu(update, context)
-        await update.callback_query.answer()
-        return
-    # User selects a specific pair
-    if data.startswith('pair_'):
-        _, mode, sym = data.split('_', 2)
-        # Send initial analysis
-        await context.bot.send_message(uid, f"Analyzing {sym} on {mode}...", parse_mode='HTML')
-        sig = await generate_signal(sym, mode)
-        if not sig or not sig.get('signal'):
-            await context.bot.send_message(uid, f"No valid signal for {sym}.")
-        else:
-            msg, kb = format_signal(sig, mode)
-            await context.bot.send_message(uid, msg, parse_mode='HTML', reply_markup=kb)
-        # Schedule continuous monitoring every minute
-        job_id = f"monitor_{uid}_{mode}_{sym}" 
-        # Remove existing job if any
-        try:
-            scheduler.remove_job(job_id)
-        except Exception:
-            pass
-        # Add new job
-        scheduler.add_job(
-            lambda job_uid=uid, job_mode=mode, job_sym=sym: asyncio.create_task(
-                process_symbol(context.application, job_sym, job_mode)
-            ),
-            'interval', minutes=1, id=job_id
-        )
-        await context.bot.send_message(uid, f"Started monitoring {sym} every minute.")
-        await update.callback_query.answer()
-        return
-    # Monitor action
-    parts = data.split('_')
-    if parts[0] == 'monitor':
-        mode = parts[1]
-        sym = '_'.join(parts[2:])
-        sig = await generate_signal(sym, mode)
-        status = 'No signal' if not sig else f"{sig['direction']} @ {sig['price']}"
-        await context.bot.send_message(uid, f"<b>{sym}</b>: {status}", parse_mode='HTML')
-        await update.callback_query.answer()
-
-# === MAIN ===
-# Initialize and start APScheduler
-scheduler = AsyncIOScheduler()
-scheduler.start()
-
 def main():
     app = ApplicationBuilder().token(TELEGRAM_BOT_TOKEN).build()
     app.add_handler(CommandHandler('start', start))
-    app.add_handler(CommandHandler('generate_token', generate_token))
     app.add_handler(CommandHandler('activate', activate))
-    app.add_handler(CallbackQueryHandler(button_handler))
-
-    # Global monitoring disabled; only track user-selected pairs
-
-
+    app.add_handler(CommandHandler('new', new_signal))
+    app.add_handler(CommandHandler('stats', pnl_stats))
+    app.add_handler(CommandHandler('generate_token', generate_token))
+    app.add_handler(CallbackQueryHandler(handle_signal, pattern=r'^signal_'))
+    app.add_handler(CallbackQueryHandler(handle_entry, pattern=r'^enter_'))
     app.run_polling()
 
 if __name__ == '__main__':
